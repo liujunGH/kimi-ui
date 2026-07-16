@@ -17,7 +17,9 @@
 //!   - on macOS the window uses a hidden-inset title bar and the SPA's
 //!     `macos-desktop` layout; the SPA's `-webkit-app-region` drag areas (wry
 //!     ignores that CSS) are mirrored to Tauri's `data-tauri-drag-region`, and
-//!     the "internal testing" badge that `?kimi_desktop` enables is hidden.
+//!     the "internal testing" badge that `?kimi_desktop` enables is hidden;
+//!   - streaming thinking blocks are height-capped so the chat view stops
+//!     climbing during long reasoning streams.
 //!
 //! The daemon exits by itself 60s after the last client disconnects, so the
 //! shell does not manage its lifecycle.
@@ -78,6 +80,20 @@ const INIT_SCRIPT: &str = r#"
     var pills = document.querySelectorAll('.internal-build-tag');
     for (var j = 0; j < pills.length; j++) {
       pills[j].style.display = 'none';
+    }
+    // 4. Cap the streaming thinking block at a fixed height so the page stops
+    //    "climbing" during long reasoning streams; the block scrolls
+    //    internally, and the SPA still auto-collapses it afterwards (inline
+    //    styles are removed again so the collapsed preview keeps its look).
+    var streaming = document.querySelectorAll('.tc-wrap:not(.is-collapsed) pre.tc');
+    for (var k = 0; k < streaming.length; k++) {
+      streaming[k].style.maxHeight = '9em';
+      streaming[k].style.overflowY = 'auto';
+    }
+    var collapsed = document.querySelectorAll('.tc-wrap.is-collapsed pre.tc');
+    for (var m = 0; m < collapsed.length; m++) {
+      collapsed[m].style.maxHeight = '';
+      collapsed[m].style.overflowY = '';
     }
   }
   new MutationObserver(patchDom).observe(document.documentElement, { childList: true, subtree: true });
