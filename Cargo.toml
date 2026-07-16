@@ -1,0 +1,22 @@
+[package]
+name = "kimi-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal desktop shell for the Kimi Code web UI (system WebView, low memory)"
+
+[dependencies]
+# custom-protocol: makes WebviewUrl::App resolve to embedded assets in release
+# builds too (bare `cargo build` would otherwise assume a dev server URL).
+tauri = { version = "2", features = ["custom-protocol"] }
+serde_json = "1"
+tauri-plugin-notification = "2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+panic = "abort"

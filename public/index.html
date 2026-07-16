@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Kimi Code</title>
+    <style>
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        align-items: center;
+        justify-content: center;
+        font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+        background: #0d1117;
+        color: #8b949e;
+        font-size: 14px;
+      }
+      .spinner {
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: 3px solid #30363d;
+        border-top-color: #58a6ff;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      #err {
+        color: #f85149;
+        max-width: 72%;
+        line-height: 1.7;
+        white-space: pre-wrap;
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="spinner" id="spinner"></div>
+    <div id="status">正在启动 Kimi Code…</div>
+    <div id="err"></div>
+    <script>
+      window.__kimiBootError = function (msg) {
+        document.getElementById("spinner").style.display = "none";
+        document.getElementById("status").style.display = "none";
+        const err = document.getElementById("err");
+        err.style.display = "block";
+        err.textContent = msg;
+      };
+    </script>
+  </body>
+</html>
