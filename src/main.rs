@@ -502,9 +502,9 @@ fn main() {
 //
 // There is NO REST/cloud endpoint for membership quota (verified
 // exhaustively), but the TUI's `/usage` command renders it. So every ~10min
-// we boot a headless TUI in a hidden tmux session (with a throwaway
+// we boot a headless TUI in an EMBEDDED PTY (with a throwaway
 // KIMI_CODE_HOME holding a copy of the credentials), send `/usage`, and
-// parse the rendered box. Hacky but the only data source that exists.
+// parse the rendered screen via a vt100 parser — no external tmux needed.
 // ---------------------------------------------------------------------------
 
 /// Plan quota as rendered by the TUI's `/usage`.
@@ -569,26 +569,80 @@ fn copy_tree(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Locate an executable on PATH or in well-known Homebrew locations.
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+/// Spawn `program` in an embedded PTY, dismiss first-run dialogs, send
+/// `input`, and return the final rendered screen via a vt100 parser
+/// (same fidelity as `tmux capture-pane`, but zero external dependencies).
+fn run_in_pty(
+    program: &PathBuf,
+    cwd: &PathBuf,
+    envs: &[(&str, &str)],
+    input: &str,
+    boot_wait: Duration,
+    after_input_wait: Duration,
+) -> Result<String, String> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 50,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())?;
+    let mut cmd = CommandBuilder::new(program);
+    cmd.cwd(cwd);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn 失败：{e}"))?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 16384];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
             }
         }
+    });
+
+    let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    thread::sleep(boot_wait);
+    // Dismiss any first-run dialog (e.g. kimi-cli migration prompt).
+    let _ = writer.write_all(b"\x1b");
+    thread::sleep(Duration::from_millis(800));
+    let _ = writer.write_all(input.as_bytes());
+    let _ = writer.write_all(b"\r");
+    thread::sleep(after_input_wait);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(writer);
+    thread::sleep(Duration::from_millis(300));
+    let mut raw = Vec::new();
+    while let Ok(chunk) = rx.try_recv() {
+        raw.extend_from_slice(&chunk);
     }
-    let candidates = [
-        PathBuf::from(format!("/opt/homebrew/bin/{name}")),
-        PathBuf::from(format!("/usr/local/bin/{name}")),
-    ];
-    candidates.into_iter().find(|p| p.is_file())
+    let mut parser = vt100::Parser::new(50, 200, 0);
+    parser.process(&raw);
+    Ok(parser.screen().contents())
 }
 
-/// Boot a headless TUI, send /usage, parse the output. Takes ~10s.
+/// Boot a headless TUI in an embedded PTY, send /usage, parse the output.
+/// Takes ~10s.
 fn scrape_plan_usage() -> Result<PlanUsage, String> {
-    let tmux = find_on_path("tmux").ok_or("未找到 tmux")?;
     let kimi = find_kimi().ok_or("找不到 kimi CLI")?;
 
     // Throwaway home with a copy of the credentials, so probe sessions and
@@ -608,50 +662,18 @@ fn scrape_plan_usage() -> Result<PlanUsage, String> {
     let probe = sandbox.join("probe");
     fs::create_dir_all(&probe).map_err(|e| e.to_string())?;
 
-    let session = format!("kimi-usage-{}", std::process::id());
-    let shell_cmd = format!(
-        "cd '{}' && KIMI_CODE_HOME='{}' '{}'",
-        probe.display(),
-        sandbox.display(),
-        kimi.display()
+    let home_str = sandbox.display().to_string();
+    let result = run_in_pty(
+        &kimi,
+        &probe,
+        &[("KIMI_CODE_HOME", home_str.as_str())],
+        "/usage",
+        Duration::from_secs(6),
+        Duration::from_secs(4),
     );
-    let cleanup = |session: &str| {
-        let _ = Command::new(&tmux)
-            .args(["kill-session", "-t", session])
-            .output();
-        let _ = fs::remove_dir_all(&sandbox);
-    };
+    let _ = fs::remove_dir_all(&sandbox);
+    let text = result?;
 
-    let start = Command::new(&tmux)
-        .args(["new-session", "-d", "-s", &session, "-x", "200", "-y", "50"])
-        .arg(&shell_cmd)
-        .output()
-        .map_err(|e| format!("tmux 启动失败：{e}"))?;
-    if !start.status.success() {
-        cleanup(&session);
-        return Err(format!(
-            "tmux new-session 失败：{}",
-            String::from_utf8_lossy(&start.stderr).trim()
-        ));
-    }
-
-    thread::sleep(Duration::from_secs(6));
-    // Dismiss any first-run dialog (e.g. kimi-cli migration prompt).
-    let _ = Command::new(&tmux)
-        .args(["send-keys", "-t", &session, "Escape"])
-        .output();
-    thread::sleep(Duration::from_millis(800));
-    let _ = Command::new(&tmux)
-        .args(["send-keys", "-t", &session, "/usage", "Enter"])
-        .output();
-    thread::sleep(Duration::from_secs(4));
-    let capture = Command::new(&tmux)
-        .args(["capture-pane", "-t", &session, "-p"])
-        .output();
-    cleanup(&session);
-
-    let capture = capture.map_err(|e| format!("tmux capture 失败：{e}"))?;
-    let text = String::from_utf8_lossy(&capture.stdout);
     let mut weekly = None;
     let mut hourly = None;
     for line in text.lines() {

@@ -11,7 +11,7 @@ A lightweight desktop shell for the official [Kimi Code](https://www.kimi.com/co
 - **Native notifications**: polyfills the missing WKWebView `Notification` API — completion/question/approval alerts become macOS notifications; clicking one re-focuses the window
 - **Dock badge**: unread-notification count on the Dock icon, cleared when the window regains focus
 - **Native status bar**: a shell-owned strip at the bottom of the window (the SPA never overlaps it) showing live context usage and model; it talks to the daemon directly over REST/WebSocket with zero DOM coupling to the official page — and it's the shell's extension surface
-- **Plan quota**: the strip also shows membership quota (5-hour / weekly) with reset countdown; there is no public endpoint for it, so the shell periodically runs a headless TUI `/usage` in a hidden tmux session and parses the output (requires tmux, degrades gracefully)
+- **Plan quota**: the strip also shows membership quota (5-hour / weekly) with reset countdown; there is no public endpoint for it, so the shell periodically runs a headless TUI `/usage` inside an embedded pseudo-terminal (via `portable-pty` + `vt100`) and parses the rendered screen — zero external dependencies, degrades gracefully
 - **Swarm panel**: the status bar's "蜂群" button expands a live subagent roster — status dots, swarm index, task description, result summary, token usage (fed by the daemon's `subagent.*` events)
 - **No more chat climbing**: streaming thinking blocks are height-capped and scroll internally, so long reasoning streams stop pushing the page upward
 - **Downloads**: session exports etc. land in `~/Downloads`, de-duplicated as `name (n).ext`
