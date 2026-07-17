@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>status</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100vh;
+        overflow: hidden;
+        font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+        font-size: 12px;
+        background: transparent;
+        user-select: none;
+      }
+      :root {
+        --bg: rgba(255, 255, 255, 0.96);
+        --fg: #24292f;
+        --dim: #57606a;
+        --border: #d0d7de;
+        --accent: #1f6feb;
+        --shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: rgba(22, 27, 34, 0.97);
+          --fg: #c9d1d9;
+          --dim: #8b949e;
+          --border: #30363d;
+          --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+        }
+      }
+      #backdrop {
+        position: absolute;
+        inset: 0 0 28px 0;
+        display: none;
+      }
+      #backdrop.show { display: block; }
+      #bar {
+        position: absolute;
+        left: 0; right: 0; bottom: 0;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 10px;
+        box-sizing: border-box;
+        background: var(--bg);
+        border-top: 1px solid var(--border);
+        color: var(--dim);
+      }
+      #usage { cursor: pointer; padding: 2px 4px; border-radius: 6px; }
+      #usage:hover { background: rgba(127, 127, 127, 0.12); }
+      #usage b { font-weight: 600; }
+      .ok { color: #3fb950; }
+      .warn { color: #d29922; }
+      .crit { color: #f85149; }
+      #dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); display: inline-block; }
+      #dot.busy { background: #3fb950; }
+      #spacer { flex: 1; }
+      .btn {
+        color: var(--accent);
+        cursor: pointer;
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-weight: 600;
+      }
+      .btn:hover, .btn.active { background: rgba(31, 111, 235, 0.12); }
+      .card {
+        position: absolute;
+        bottom: 36px;
+        display: none;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        box-shadow: var(--shadow);
+        padding: 10px 12px;
+        color: var(--fg);
+      }
+      .card.show { display: block; }
+      #usageCard { left: 8px; width: 250px; }
+      #swarmCard { right: 8px; width: 320px; max-height: 280px; overflow-y: auto; }
+      .row { display: flex; justify-content: space-between; padding: 2px 0; }
+      .row .k { color: var(--dim); }
+      .agent { padding: 5px 0; border-top: 1px solid var(--border); }
+      .agent:first-child { border-top: none; }
+      .dim { color: var(--dim); }
+      .summary { margin-top: 2px; }
+      .tokens { float: right; color: var(--dim); }
+    </style>
+  </head>
+  <body>
+    <div id="backdrop"></div>
+    <div id="usageCard" class="card"></div>
+    <div id="swarmCard" class="card"></div>
+    <div id="bar">
+      <span id="dot"></span>
+      <span id="usage">…</span>
+      <span id="spacer"></span>
+      <span id="swarmBtn" class="btn">蜂群 <span id="swarmCount" class="dim">0</span></span>
+    </div>
+    <script>
+      'use strict';
+      var daemon = null;
+      var mode = 'none';            // 'none' | 'usage' | 'swarm'
+      var currentSid = null;
+      var ws = null;
+      var lastUsage = null;
+      var swarm = { agents: {}, order: [], showDone: false };
+
+      document.getElementById('swarmCard').addEventListener('click', function (e) {
+        if (e.target.closest('[data-toggle-done]')) {
+          swarm.showDone = !swarm.showDone;
+          renderSwarm();
+        }
+      });
+
+      function invoke(cmd, args) {
+        return window.__TAURI_INTERNALS__.invoke(cmd, args || {});
+      }
+      function esc(s) {
+        return String(s).replace(/[&<>"]/g, function (c) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+        });
+      }
+
+      // ---- overlay cards ----
+      function setMode(next) {
+        mode = next;
+        invoke('set_overlay', { mode: mode });
+        document.getElementById('backdrop').className = mode === 'none' ? '' : 'show';
+        document.getElementById('usageCard').className = 'card' + (mode === 'usage' ? ' show' : '');
+        document.getElementById('swarmCard').className = 'card' + (mode === 'swarm' ? ' show' : '');
+        document.getElementById('swarmBtn').className = 'btn' + (mode === 'swarm' ? ' active' : '');
+        if (mode === 'usage') renderUsageCard();
+        if (mode === 'swarm') renderSwarm();
+      }
+      document.getElementById('backdrop').onclick = function () { setMode('none'); };
+      document.getElementById('usage').onclick = function () {
+        setMode(mode === 'usage' ? 'none' : 'usage');
+      };
+      document.getElementById('swarmBtn').onclick = function () {
+        setMode(mode === 'swarm' ? 'none' : 'swarm');
+      };
+
+      // ---- boot: wait for daemon info from Rust ----
+      function boot(tries) {
+        invoke('daemon_info').then(function (info) {
+          daemon = info;
+          pollUsage();
+          setInterval(pollUsage, 12000);
+          connectWs();
+        }).catch(function () {
+          if (tries > 0) setTimeout(function () { boot(tries - 1); }, 600);
+          else document.getElementById('usage').textContent = 'daemon 未就绪';
+        });
+      }
+
+      // ---- usage polling ----
+      function api(path) {
+        return fetch(daemon.base + path, { headers: { Authorization: 'Bearer ' + daemon.token } })
+          .then(function (r) { return r.json(); });
+      }
+      function pollUsage() {
+        if (!daemon) return;
+        api('/api/v1/sessions?page_size=50').then(function (d) {
+          var items = (d.data && d.data.items) || [];
+          var pick = items.find(function (s) { return s.busy; })
+            || items.filter(function (s) { return !s.archived; })[0];
+          if (!pick) return;
+          if (pick.id !== currentSid) { currentSid = pick.id; resubscribe(); }
+          return api('/api/v1/sessions/' + pick.id + '/status').then(function (d2) {
+            lastUsage = { session: pick, status: d2.data || {} };
+            renderBar();
+            if (mode === 'usage') renderUsageCard();
+          });
+        }).catch(function () {});
+      }
+      function renderBar() {
+        if (!lastUsage) return;
+        var st = lastUsage.status;
+        var pct = Math.round((st.context_usage || 0) * 100);
+        var cls = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : 'ok';
+        var model = st.model ? String(st.model).split('/').pop() : '';
+        document.getElementById('usage').innerHTML =
+          '上下文 <b class="' + cls + '">' + pct + '%</b>' + (model ? ' · ' + esc(model) : '');
+        document.getElementById('dot').className = st.busy ? 'busy' : '';
+        document.getElementById('dot').title = st.busy ? '运行中' : '空闲';
+      }
+      function renderUsageCard() {
+        if (!lastUsage) return;
+        var st = lastUsage.status, s = lastUsage.session;
+        var rows = [
+          ['会话', String(s.title || '').slice(0, 24)],
+          ['模型', st.model || '-'],
+          ['思考', st.thinking_level || '-'],
+          ['权限', st.permission || '-'],
+          ['上下文', (st.context_tokens || 0) + ' / ' + (st.max_context_tokens || 0)],
+          ['状态', st.busy ? '运行中' : '空闲']
+        ];
+        document.getElementById('usageCard').innerHTML = rows.map(function (r) {
+          return '<div class="row"><span class="k">' + esc(r[0]) + '</span><span>' + esc(String(r[1])) + '</span></div>';
+        }).join('');
+      }
+
+      // ---- swarm roster over our own WebSocket ----
+      function connectWs() {
+        if (!daemon) return;
+        var url = daemon.base.replace(/^http/, 'ws') + '/api/v1/ws?client_id=kimi-ui-status';
+        ws = new WebSocket(url, ['kimi-code.bearer.' + daemon.token]);
+        ws.onopen = function () { resubscribe(); };
+        ws.onmessage = function (ev) {
+          if (typeof ev.data !== 'string') return;
+          var f;
+          try { f = JSON.parse(ev.data); } catch (e) { return; }
+          var p = f.payload && typeof f.payload === 'object' ? f.payload : f;
+          if (!p || typeof p.type !== 'string') return;
+          if (p.type.indexOf('subagent.') === 0 || p.type === 'turn.started') swarmEvent(p);
+        };
+        ws.onclose = function () { setTimeout(connectWs, 3000); };
+      }
+      function resubscribe() {
+        if (!currentSid) return;
+        // Seed the roster from the session snapshot — live events only cover
+        // what happens after we subscribe (e.g. after an app restart).
+        swarm = { agents: {}, order: [] };
+        api('/api/v1/sessions/' + currentSid + '/snapshot').then(function (d) {
+          var subs = (d.data && d.data.subagents) || [];
+          subs.forEach(function (s) {
+            if (s.kind && s.kind !== 'subagent') return;
+            var id = s.id || s.subagent_id;
+            if (!id) return;
+            swarm.agents[id] = {
+              name: s.subagent_type || s.subagentType || 'agent',
+              desc: s.description || '',
+              status: ({ queued: 'working', working: 'working', suspended: 'suspended', failed: 'failed' })[s.subagent_phase] || 'completed',
+              tokens: '',
+              summary: s.output_preview || '',
+              swarmIndex: s.swarm_index != null ? s.swarm_index : null
+            };
+            swarm.order.push(id);
+          });
+          renderSwarm();
+        }).catch(function () {});
+        if (!ws || ws.readyState !== 1) return;
+        ws.send(JSON.stringify({
+          type: 'client_hello', id: '1',
+          payload: { client_id: 'kimi-ui-status', subscriptions: [currentSid], cursors: {} }
+        }));
+      }
+      function fmtUsage(u) {
+        if (!u) return '';
+        var total = 0;
+        for (var k in u) { if (typeof u[k] === 'number') total += u[k]; }
+        if (!total) return '';
+        return total >= 1000 ? (total / 1000).toFixed(1) + 'K tok' : total + ' tok';
+      }
+      function swarmEvent(p) {
+        var m = p.type.match(/^subagent\.(spawned|started|suspended|completed|failed)$/);
+        if (!m) return;
+        var id = p.subagentId || p.subagent_id;
+        if (!id) return;
+        var a = swarm.agents[id];
+        if (!a) {
+          a = swarm.agents[id] = {
+            name: p.subagentName || p.subagent_name || 'agent',
+            desc: p.description || '',
+            status: 'working', tokens: '', summary: '',
+            swarmIndex: p.swarmIndex != null ? p.swarmIndex : p.swarm_index
+          };
+          swarm.order.push(id);
+        }
+        if (m[1] === 'suspended') a.status = 'suspended';
+        else if (m[1] === 'completed') {
+          a.status = 'completed';
+          a.summary = p.resultSummary || p.result_summary || a.summary;
+          a.tokens = fmtUsage(p.usage) || a.tokens;
+        } else if (m[1] === 'failed') a.status = 'failed';
+        else a.status = 'working';
+        renderSwarm();
+      }
+      function renderSwarm() {
+        document.getElementById('swarmCount').textContent = swarm.order.length;
+        if (mode !== 'swarm') return;
+        var statusText = { working: '运行中', suspended: '挂起', completed: '完成', failed: '失败' };
+        var active = [], done = [];
+        for (var i = 0; i < swarm.order.length; i++) {
+          var a = swarm.agents[swarm.order[i]];
+          (a.status === 'completed' ? done : active).push(a);
+        }
+        function row(a) {
+          var cls = a.status === 'working' ? 'ok' : a.status === 'suspended' ? 'warn' : a.status === 'failed' ? 'crit' : 'dim';
+          return '<div class="agent">'
+            + '<span class="' + cls + '">●</span> <b>' + esc(a.name) + '</b>'
+            + (a.swarmIndex != null ? ' <span class="dim">#' + a.swarmIndex + '</span>' : '')
+            + ' <span class="' + cls + '">' + (statusText[a.status] || a.status) + '</span>'
+            + (a.tokens ? '<span class="tokens">' + a.tokens + '</span>' : '')
+            + (a.desc ? '<div class="dim">' + esc(a.desc) + '</div>' : '')
+            + (a.summary ? '<div class="summary">' + esc(a.summary) + '</div>' : '')
+            + '</div>';
+        }
+        var html = '';
+        if (!swarm.order.length) html = '<div class="dim" style="padding:8px 0">本回合还没有子代理记录</div>';
+        html += active.map(row).join('');
+        // Scale guard: with many subagents (swarm), collapse the completed
+        // ones behind a summary row instead of a wall of cards.
+        if (done.length <= 5) {
+          html += done.map(row).join('');
+        } else if (swarm.showDone) {
+          html += done.map(row).join('')
+            + '<div class="agent dim" data-toggle-done style="cursor:pointer">▴ 收起已完成（' + done.length + '）</div>';
+        } else {
+          html += '<div class="agent dim" data-toggle-done style="cursor:pointer">✓ 已完成 ' + done.length + ' 个子代理（点击展开）</div>';
+        }
+        document.getElementById('swarmCard').innerHTML = html;
+      }
+
+      boot(20);
+    </script>
+  </body>
+</html>

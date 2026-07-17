@@ -1,8 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main window: allow Tauri's built-in drag-region handling.",
+  "description": "Permissions for the main window. The page is a REMOTE origin (the local kimi daemon), so remote.urls must cover it — otherwise every IPC invoke from the injected script is silently denied.",
   "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
   "permissions": [
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize"
