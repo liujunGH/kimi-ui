@@ -44,10 +44,11 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        atomic::{AtomicU32, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
         Mutex,
     },
     thread,
+    time::Duration,
 };
 
 use serde_json::Value;
@@ -414,7 +415,8 @@ fn main() {
             focus_window,
             toggle_maximize,
             daemon_info,
-            set_overlay
+            set_overlay,
+            plan_usage
         ])
         .setup(|app| {
             let window_builder = WindowBuilder::new(app, "main")
@@ -481,4 +483,208 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running kimi-ui");
+}
+
+// ---------------------------------------------------------------------------
+// Plan-usage scraping.
+//
+// There is NO REST/cloud endpoint for membership quota (verified
+// exhaustively), but the TUI's `/usage` command renders it. So every ~10min
+// we boot a headless TUI in a hidden tmux session (with a throwaway
+// KIMI_CODE_HOME holding a copy of the credentials), send `/usage`, and
+// parse the rendered box. Hacky but the only data source that exists.
+// ---------------------------------------------------------------------------
+
+/// Plan quota as rendered by the TUI's `/usage`.
+#[derive(Clone, serde::Serialize)]
+struct PlanUsage {
+    weekly_pct: u32,
+    weekly_reset: String,
+    hourly_pct: u32,
+    hourly_reset: String,
+    fetched_at: u64,
+}
+
+static PLAN_USAGE: Mutex<Option<PlanUsage>> = Mutex::new(None);
+static SCRAPE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Scrape TTL: the status page may ask often, we scrape at most this often.
+const SCRAPE_TTL_SECS: u64 = 600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse one "X% used ... resets in Y" line of the /usage box.
+fn parse_usage_line(line: &str) -> Option<(u32, String)> {
+    let pct_end = line.find("% used")?;
+    let digits: String = line[..pct_end]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let pct: u32 = digits.parse().ok()?;
+    let reset = line
+        .split("resets in ")
+        .nth(1)?
+        .trim()
+        .trim_matches('│')
+        .trim()
+        .to_string();
+    Some((pct, reset))
+}
+
+/// Copy a file or directory tree (small credential dirs only).
+fn copy_tree(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else if src.is_file() {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Locate an executable on PATH or in well-known Homebrew locations.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let candidates = [
+        PathBuf::from(format!("/opt/homebrew/bin/{name}")),
+        PathBuf::from(format!("/usr/local/bin/{name}")),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Boot a headless TUI, send /usage, parse the output. Takes ~10s.
+fn scrape_plan_usage() -> Result<PlanUsage, String> {
+    let tmux = find_on_path("tmux").ok_or("未找到 tmux")?;
+    let kimi = find_kimi().ok_or("找不到 kimi CLI")?;
+
+    // Throwaway home with a copy of the credentials, so probe sessions and
+    // their junk never touch the user's real data directory.
+    let sandbox = std::env::temp_dir().join(format!("kimi-usage-home-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&sandbox);
+    fs::create_dir_all(&sandbox).map_err(|e| e.to_string())?;
+    let real_home = kimi_home();
+    // Migration markers and device id included so the sandboxed TUI does not
+    // stop at first-run dialogs; an Escape is sent anyway as a fallback.
+    for item in ["config.toml", "credentials", "oauth", "device_id", "migration-report.json"] {
+        let src = real_home.join(item);
+        if src.exists() {
+            let _ = copy_tree(&src, &sandbox.join(item));
+        }
+    }
+    let probe = sandbox.join("probe");
+    fs::create_dir_all(&probe).map_err(|e| e.to_string())?;
+
+    let session = format!("kimi-usage-{}", std::process::id());
+    let shell_cmd = format!(
+        "cd '{}' && KIMI_CODE_HOME='{}' '{}'",
+        probe.display(),
+        sandbox.display(),
+        kimi.display()
+    );
+    let cleanup = |session: &str| {
+        let _ = Command::new(&tmux)
+            .args(["kill-session", "-t", session])
+            .output();
+        let _ = fs::remove_dir_all(&sandbox);
+    };
+
+    let start = Command::new(&tmux)
+        .args(["new-session", "-d", "-s", &session, "-x", "200", "-y", "50"])
+        .arg(&shell_cmd)
+        .output()
+        .map_err(|e| format!("tmux 启动失败：{e}"))?;
+    if !start.status.success() {
+        cleanup(&session);
+        return Err(format!(
+            "tmux new-session 失败：{}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        ));
+    }
+
+    thread::sleep(Duration::from_secs(6));
+    // Dismiss any first-run dialog (e.g. kimi-cli migration prompt).
+    let _ = Command::new(&tmux)
+        .args(["send-keys", "-t", &session, "Escape"])
+        .output();
+    thread::sleep(Duration::from_millis(800));
+    let _ = Command::new(&tmux)
+        .args(["send-keys", "-t", &session, "/usage", "Enter"])
+        .output();
+    thread::sleep(Duration::from_secs(4));
+    let capture = Command::new(&tmux)
+        .args(["capture-pane", "-t", &session, "-p"])
+        .output();
+    cleanup(&session);
+
+    let capture = capture.map_err(|e| format!("tmux capture 失败：{e}"))?;
+    let text = String::from_utf8_lossy(&capture.stdout);
+    let mut weekly = None;
+    let mut hourly = None;
+    for line in text.lines() {
+        if line.contains("Weekly limit") {
+            weekly = parse_usage_line(line);
+        } else if line.contains("5h limit") {
+            hourly = parse_usage_line(line);
+        }
+    }
+    match (weekly, hourly) {
+        (Some((weekly_pct, weekly_reset)), Some((hourly_pct, hourly_reset))) => Ok(PlanUsage {
+            weekly_pct,
+            weekly_reset,
+            hourly_pct,
+            hourly_reset,
+            fetched_at: now_secs(),
+        }),
+        _ => Err("解析 /usage 输出失败（TUI 格式可能已变化）".to_string()),
+    }
+}
+
+/// The status page asks for plan quota; we return the cache and refresh it
+/// in the background when stale.
+#[tauri::command]
+fn plan_usage() -> Value {
+    let stale = PLAN_USAGE
+        .lock()
+        .map(|u| u.as_ref().map_or(true, |u| u.fetched_at + SCRAPE_TTL_SECS < now_secs()))
+        .unwrap_or(true);
+    if stale && !SCRAPE_RUNNING.swap(true, Ordering::Relaxed) {
+        thread::spawn(|| {
+            match scrape_plan_usage() {
+                Ok(u) => {
+                    if let Ok(mut guard) = PLAN_USAGE.lock() {
+                        *guard = Some(u);
+                    }
+                }
+                Err(e) => eprintln!("kimi-ui: 额度抓取失败：{e}"),
+            }
+            SCRAPE_RUNNING.store(false, Ordering::Relaxed);
+        });
+    }
+    let guard = PLAN_USAGE.lock().ok();
+    match guard.as_ref().and_then(|g| g.as_ref()) {
+        Some(u) => serde_json::to_value(u).unwrap_or_else(|_| Value::Null),
+        None => serde_json::json!({ "loading": true }),
+    }
 }

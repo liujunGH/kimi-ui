@@ -97,6 +97,7 @@
       <span id="dot"></span>
       <span id="usage">…</span>
       <span id="spacer"></span>
+      <span id="plan" class="dim" title="套餐额度（每 10 分钟更新）"></span>
       <span id="swarmBtn" class="btn">蜂群 <span id="swarmCount" class="dim">0</span></span>
     </div>
     <script>
@@ -156,6 +157,27 @@
         });
       }
 
+      // ---- plan quota (scraped from the TUI's /usage by the Rust side) ----
+      var planUsage = null;
+      function pollPlanUsage() {
+        invoke('plan_usage').then(function (d) {
+          if (d && typeof d.weekly_pct === 'number') {
+            planUsage = d;
+            renderPlan();
+            if (mode === 'usage') renderUsageCard();
+          }
+        }).catch(function () {});
+      }
+      function renderPlan() {
+        if (!planUsage) return;
+        var el = document.getElementById('plan');
+        var cls = planUsage.hourly_pct >= 90 ? 'crit' : planUsage.hourly_pct >= 70 ? 'warn' : 'dim';
+        el.innerHTML = '5h <b class="' + cls + '" style="font-weight:600">' + planUsage.hourly_pct + '%</b>'
+          + ' · 周 ' + planUsage.weekly_pct + '%';
+      }
+      pollPlanUsage();
+      setInterval(pollPlanUsage, 60000);
+
       // ---- usage polling ----
       function api(path) {
         return fetch(daemon.base + path, { headers: { Authorization: 'Bearer ' + daemon.token } })
@@ -198,6 +220,10 @@
           ['上下文', (st.context_tokens || 0) + ' / ' + (st.max_context_tokens || 0)],
           ['状态', st.busy ? '运行中' : '空闲']
         ];
+        if (planUsage) {
+          rows.push(['5 小时额度', planUsage.hourly_pct + '%（' + planUsage.hourly_reset + '后重置）']);
+          rows.push(['每周额度', planUsage.weekly_pct + '%（' + planUsage.weekly_reset + '后重置）']);
+        }
         document.getElementById('usageCard').innerHTML = rows.map(function (r) {
           return '<div class="row"><span class="k">' + esc(r[0]) + '</span><span>' + esc(String(r[1])) + '</span></div>';
         }).join('');
