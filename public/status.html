@@ -159,12 +159,20 @@
 
       // ---- plan quota (scraped from the TUI's /usage by the Rust side) ----
       var planUsage = null;
+      var planLoadingRounds = 0;
       function pollPlanUsage() {
         invoke('plan_usage').then(function (d) {
           if (d && typeof d.weekly_pct === 'number') {
             planUsage = d;
+            planLoadingRounds = 0;
             renderPlan();
             if (mode === 'usage') renderUsageCard();
+          } else {
+            // Scrape still running or failing; after a few rounds of
+            // "loading", show a visible degradation instead of nothing.
+            if (++planLoadingRounds >= 3 && !planUsage) {
+              document.getElementById('plan').textContent = '额度 –';
+            }
           }
         }).catch(function () {});
       }
@@ -178,33 +186,48 @@
       pollPlanUsage();
       setInterval(pollPlanUsage, 60000);
 
-      // ---- usage polling ----
+      // ---- usage polling + structural health check ----
+      // Three states: ok / down (daemon unreachable, transient) / broken
+      // (daemon alive but REST shape drifted → shell needs an update).
+      var health = 'ok';
+      function setHealth(next) {
+        if (health === next) return;
+        health = next;
+        renderBar();
+      }
       function api(path) {
         return fetch(daemon.base + path, { headers: { Authorization: 'Bearer ' + daemon.token } })
           .then(function (r) { return r.json(); });
       }
       function pollUsage() {
         if (!daemon) return;
-        api('/api/v1/sessions?page_size=50').then(function (d) {
-          var items = (d.data && d.data.items) || [];
-          var pick = items.find(function (s) { return s.busy; })
-            || items.filter(function (s) { return !s.archived; })[0];
-          if (!pick) return;
-          if (pick.id !== currentSid) { currentSid = pick.id; resubscribe(); }
-          return api('/api/v1/sessions/' + pick.id + '/status').then(function (d2) {
-            lastUsage = { session: pick, status: d2.data || {} };
-            renderBar();
-            if (mode === 'usage') renderUsageCard();
+        api('/api/v1/meta').then(function () {
+          return api('/api/v1/sessions?page_size=50').then(function (d) {
+            var items = d.data && d.data.items;
+            if (!items) { setHealth('broken'); return; }
+            setHealth('ok');
+            var pick = items.find(function (s) { return s.busy; })
+              || items.filter(function (s) { return !s.archived; })[0];
+            if (!pick) return;
+            if (pick.id !== currentSid) { currentSid = pick.id; resubscribe(); }
+            return api('/api/v1/sessions/' + pick.id + '/status').then(function (d2) {
+              lastUsage = { session: pick, status: d2.data || {} };
+              renderBar();
+              if (mode === 'usage') renderUsageCard();
+            });
           });
-        }).catch(function () {});
+        }).catch(function () { setHealth('down'); });
       }
       function renderBar() {
+        var usageEl = document.getElementById('usage');
+        if (health === 'down') { usageEl.innerHTML = '<span class="dim">daemon 未连接</span>'; return; }
+        if (health === 'broken') { usageEl.innerHTML = '<span class="crit">接口结构变化，壳需要更新</span>'; return; }
         if (!lastUsage) return;
         var st = lastUsage.status;
         var pct = Math.round((st.context_usage || 0) * 100);
         var cls = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : 'ok';
         var model = st.model ? String(st.model).split('/').pop() : '';
-        document.getElementById('usage').innerHTML =
+        usageEl.innerHTML =
           '上下文 <b class="' + cls + '">' + pct + '%</b>' + (model ? ' · ' + esc(model) : '');
         document.getElementById('dot').className = st.busy ? 'busy' : '';
         document.getElementById('dot').title = st.busy ? '运行中' : '空闲';

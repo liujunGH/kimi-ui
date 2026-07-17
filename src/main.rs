@@ -151,20 +151,32 @@ const INIT_SCRIPT: &str = r#"
     invoke('toggle_maximize', {});
   }, true);
 
-  // 5. Watchdog: warn once if the SPA's desktop classes vanish (official UI
-  //    update renamed them) — the drag/desktop integration needs a shell update.
+  // 5. Watchdog: verify each selector group this shell depends on. If an
+  //    official UI update breaks one, warn once with the broken features.
   if (isDesktop) {
     var domWarned = false;
     setInterval(function () {
       if (domWarned) return;
+      var broken = [];
       var header = document.querySelector('.chat-header');
       var side = document.querySelector('.side');
       if ((header && !header.classList.contains('macos-desktop'))
         || (side && !side.classList.contains('macos-desktop'))) {
+        broken.push('窗口拖拽/桌面布局');
+      }
+      var pill = document.querySelector('.internal-build-tag');
+      if (pill && pill.style.display !== 'none' && pill.offsetParent !== null) {
+        broken.push('角标隐藏');
+      }
+      var tc = document.querySelector('.tc-wrap:not(.is-collapsed) pre.tc');
+      if (tc && tc.style.maxHeight !== '9em') {
+        broken.push('思考限高');
+      }
+      if (broken.length) {
         domWarned = true;
         invoke('notify', {
           title: 'Kimi Code',
-          body: '检测到官方界面结构更新，窗口拖拽和桌面布局可能已失效，请更新桌面壳'
+          body: '检测到官方界面结构更新，以下功能可能失效：' + broken.join('、') + '。请更新桌面壳'
         });
       }
     }, 20000);
