@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7 (2026-07-19)
+
+- **窗口化阶段 1**（fork web）：turn 容器加 `content-visibility: auto`，离屏消息跳过布局/绘制——长会话布局成本与历史长度解耦，实测重启后 ~315MB
+- **历史上限移除**（fork web）：600→2500→直接取消。折叠卸载/输出截断/turn 和解/content-visibility 已能承载内存，硬性截停只会误伤长会话用户
+- 清理调试期临时仪表（布局记录仪、debug_log 命令）
+- 窗口化阶段 2（结构级真窗口化）评估后决定不做：阶段 1 已拿走大部分收益，结构手术风险/收益不划算（设计稿留在 fork `apps/kimi-web/docs/virtualization.md`）
+
 ## 0.1.6 (2026-07-19)
 
 - **CI 自动发版**：`.github/workflows/release.yml`——打 `v*` tag 即在 GitHub Actions 构建 web 包 + 打包 .app 并上传 Release（macOS arm64 zip），别人下载即用，无需拉两个仓库编译

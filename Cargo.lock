@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "kimi-ui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "objc2",
  "objc2-app-kit",

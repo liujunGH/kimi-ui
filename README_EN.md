@@ -7,7 +7,7 @@ A desktop client for [Kimi Code](https://www.kimi.com/code/): **official daemon 
 ## Features
 
 - **Real app form**: own window, Dock icon, Cmd-Tab, close-to-quit; hidden-inset title bar with drag regions and double-click zoom
-- **Customized web UI** (source-level, in the fork): auto-follow resumes only when you deliberately reach the bottom; tool groups default to collapsed and unmount on close; long outputs render tail-biased; only changed turns re-render during streaming; loaded history capped at 600 messages
+- **Customized web UI** (source-level, in the fork): auto-follow resumes only when you deliberately reach the bottom; tool groups default to collapsed and unmount on close; long outputs render tail-biased; only changed turns re-render during streaming; off-screen turns skip layout/paint via `content-visibility` (windowing phase 1); unlimited history paging
 - **Native status bar**: context usage, plan quota (5h/weekly), busy dot, live swarm roster, follow/freeze toggle, update-available badge
 - **Native notifications + Dock badge**: completion/question/approval alerts as macOS notifications, unread count on the Dock icon
 - **Downloads & external links**: exports land in `~/Downloads` de-duplicated; links open in the system browser
