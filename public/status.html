@@ -98,6 +98,8 @@
       <span id="usage">…</span>
       <span id="spacer"></span>
       <span id="plan" class="dim" title="套餐额度（每 10 分钟更新）"></span>
+      <span id="freezeBtn" class="btn" title="流式输出时是否自动跟随到底部">跟随</span>
+      <span id="devtoolsBtn" class="btn" title="打开/关闭 Safari Web Inspector（内存/DOM 剖析）">调试</span>
       <span id="swarmBtn" class="btn">蜂群 <span id="swarmCount" class="dim">0</span></span>
     </div>
     <script>
@@ -142,6 +144,21 @@
       };
       document.getElementById('swarmBtn').onclick = function () {
         setMode(mode === 'swarm' ? 'none' : 'swarm');
+      };
+
+      // ---- scroll freeze toggle ("静止": stop the SPA from auto-pinning
+      //      the message list to the bottom while streaming) ----
+      var frozen = false;
+      document.getElementById('freezeBtn').onclick = function () {
+        frozen = !frozen;
+        invoke('set_scroll_freeze', { frozen: frozen });
+        this.textContent = frozen ? '静止' : '跟随';
+        this.className = 'btn' + (frozen ? ' active' : '');
+      };
+
+      document.getElementById('devtoolsBtn').onclick = function () {
+        invoke('toggle_devtools');
+        this.className = this.className === 'btn' ? 'btn active' : 'btn';
       };
 
       // ---- boot: wait for daemon info from Rust ----

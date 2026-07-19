@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5 (2026-07-18)
+
+- **壳托管定制 UI（架构升级）**：壳内置零依赖静态服务（`127.0.0.1:58628`），托管 fork 构建的 kimi-web；daemon 地址与 token 经 URL hash 交接（与官方流程同构），官方 daemon 原样使用、官方通道升级。web-dist 缺失时自动回退 daemon 内嵌 UI
+- 新增 `scripts/build-web.sh`：一键从 fork（`~/project/kimi-code` 或 `KIMI_CODE_FORK`）构建并同步 UI 到 `web-dist/`
+- **滚动静止开关**：状态栏"跟随/静止"切换——静止时通过自有 `scrollTop` 属性屏蔽 SPA 的程序化滚动赋值（原生滚轮/触摸不受影响），流式期间不再被拽回底部
+
 ## 0.1.4 (2026-07-17)
 
 - **额度采集去 tmux 化**：改用内嵌伪终端（`portable-pty` + `vt100` 精确复现屏幕）无头执行 TUI `/usage`——零外部依赖，.app 开箱即用，不再要求 `brew install tmux`

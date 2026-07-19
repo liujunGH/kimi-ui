@@ -55,6 +55,8 @@ use serde_json::Value;
 use tauri::{LogicalPosition, LogicalSize, Manager, Url, WebviewBuilder, WebviewUrl, WindowBuilder};
 use tauri_plugin_notification::NotificationExt;
 
+mod static_server;
+
 /// Status strip height (collapsed) and overlay height (card open).
 const STRIP: f64 = 28.0;
 const OVERLAY_H: f64 = 340.0;
@@ -139,7 +141,20 @@ const INIT_SCRIPT: &str = r#"
       if (ols[n].style.paddingLeft !== '2.2em') ols[n].style.paddingLeft = '2.2em';
     }
   }
-  new MutationObserver(patchDom).observe(document.documentElement, { childList: true, subtree: true });
+  // The observer only marks dirty and a 150ms coalesced run does the work:
+  // the SPA's virtualized list mutates the DOM continuously while scrolling
+  // and streaming, and running five full-document querySelectorAll per
+  // mutation was the main jank source.
+  var patchScheduled = false;
+  function schedulePatch() {
+    if (patchScheduled) return;
+    patchScheduled = true;
+    setTimeout(function () {
+      patchScheduled = false;
+      patchDom();
+    }, 150);
+  }
+  new MutationObserver(schedulePatch).observe(document.documentElement, { childList: true, subtree: true });
   patchDom();
 
   // 4. Double-click on a drag region toggles maximize (zoom).
@@ -299,6 +314,41 @@ fn connect_daemon() -> Result<Launch, String> {
     Ok(Launch { base, token, url })
 }
 
+/// Directory holding the customized kimi-web bundle (from the fork build):
+/// `<exe>/../Resources/web` when packaged, `<project>/web-dist` in dev.
+fn web_root() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(res) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("Resources/web"))
+        {
+            if res.is_dir() {
+                return Some(res);
+            }
+        }
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web-dist");
+    dev.is_dir().then_some(dev)
+}
+
+/// URL of the customized UI served by our loopback static server, with the
+/// token and live daemon origin handed over via the URL hash (same handoff
+/// shape the official daemon-hosted flow uses).
+fn custom_ui_url(base: &str, token: &str) -> Option<Url> {
+    let root = web_root()?;
+    let port = static_server::serve(root, 58628).ok()?;
+    let enc_base = base.replace(':', "%3A").replace('/', "%2F");
+    let desktop_query = if cfg!(target_os = "macos") {
+        "?kimi_desktop&platform=darwin"
+    } else {
+        ""
+    };
+    format!("http://127.0.0.1:{port}/{desktop_query}&daemon_base={enc_base}#token={token}")
+        .parse()
+        .ok()
+}
+
 /// Pick a download destination under ~/Downloads without overwriting
 /// existing files ("name (n).ext").
 fn download_destination(url: &Url) -> PathBuf {
@@ -357,7 +407,7 @@ fn notify(app: tauri::AppHandle, title: String, body: String) {
 }
 
 #[tauri::command]
-fn focus_window(window: tauri::WebviewWindow) {
+fn focus_window(window: tauri::Window) {
     let _ = window.unminimize();
     if let Err(e) = window.set_focus() {
         eprintln!("kimi-ui: 激活窗口失败：{e}");
@@ -365,7 +415,7 @@ fn focus_window(window: tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-fn toggle_maximize(window: tauri::WebviewWindow) {
+fn toggle_maximize(window: tauri::Window) {
     let result = (|| -> tauri::Result<()> {
         // macOS: maximize() zooms to fill the screen, unmaximize() restores
         // the frame from before the zoom.
@@ -377,6 +427,87 @@ fn toggle_maximize(window: tauri::WebviewWindow) {
     })();
     if let Err(e) = result {
         eprintln!("kimi-ui: 缩放窗口失败：{e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scroll freeze ("静止" mode).
+//
+// During streaming the SPA re-pins the message list to the bottom on every
+// delta, so users can't read older content mid-turn. Freezing installs an
+// own-property `scrollTop` setter (and a no-op `scrollIntoView`) on the
+// chat scroller: programmatic scrolls become no-ops, while native wheel /
+// touch scrolling bypasses the setter and keeps working. Zero jitter.
+// ---------------------------------------------------------------------------
+
+const FREEZE_JS: &str = r#"
+(function () {
+  if (window.__kimiScrollFreeze && window.__kimiScrollFreeze.on) return;
+  window.__kimiScrollFreeze = { on: true, el: null, timer: null };
+  function findScroller() {
+    var best = null, bestArea = 0;
+    var els = document.querySelectorAll('div,main,section');
+    for (var i = 0; i < els.length; i++) {
+      var e = els[i];
+      if (e.scrollHeight - e.clientHeight <= 60) continue;
+      var s = getComputedStyle(e);
+      if (s.overflowY !== 'auto' && s.overflowY !== 'scroll') continue;
+      var area = e.clientWidth * e.clientHeight;
+      if (area > bestArea) { bestArea = area; best = e; }
+    }
+    return best;
+  }
+  var desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+  function releaseEl(el) {
+    try { delete el.scrollTop; } catch (e) {}
+    if (el.__kimiFrozenSIV) { el.scrollIntoView = el.__kimiFrozenSIV; delete el.__kimiFrozenSIV; }
+  }
+  function apply() {
+    var el = findScroller();
+    if (!el || el === window.__kimiScrollFreeze.el) return;
+    if (window.__kimiScrollFreeze.el) releaseEl(window.__kimiScrollFreeze.el);
+    window.__kimiScrollFreeze.el = el;
+    Object.defineProperty(el, 'scrollTop', {
+      configurable: true,
+      get: function () { return desc.get.call(this); },
+      set: function () { /* frozen: programmatic scrolls are no-ops */ }
+    });
+    el.__kimiFrozenSIV = el.scrollIntoView;
+    el.scrollIntoView = function () {};
+  }
+  window.__kimiScrollFreeze.release = function () {
+    if (window.__kimiScrollFreeze.timer) { clearInterval(window.__kimiScrollFreeze.timer); window.__kimiScrollFreeze.timer = null; }
+    if (window.__kimiScrollFreeze.el) releaseEl(window.__kimiScrollFreeze.el);
+    window.__kimiScrollFreeze = { on: false, el: null, timer: null };
+  };
+  apply();
+  window.__kimiScrollFreeze.timer = setInterval(apply, 3000);
+})();
+"#;
+
+const UNFREEZE_JS: &str = r#"
+if (window.__kimiScrollFreeze && window.__kimiScrollFreeze.release) {
+  window.__kimiScrollFreeze.release();
+}
+"#;
+
+/// Toggle the scroll freeze on the main webview ("静止" mode).
+#[tauri::command]
+fn set_scroll_freeze(app: tauri::AppHandle, frozen: bool) {
+    if let Some(wv) = app.get_webview("main") {
+        let _ = wv.eval(if frozen { FREEZE_JS } else { UNFREEZE_JS });
+    }
+}
+
+/// Toggle Safari Web Inspector on the main webview (memory/DOM profiling).
+#[tauri::command]
+fn toggle_devtools(app: tauri::AppHandle) {
+    if let Some(wv) = app.get_webview("main") {
+        if wv.is_devtools_open() {
+            wv.close_devtools();
+        } else {
+            wv.open_devtools();
+        }
     }
 }
 
@@ -428,7 +559,9 @@ fn main() {
             toggle_maximize,
             daemon_info,
             set_overlay,
-            plan_usage
+            plan_usage,
+            set_scroll_freeze,
+            toggle_devtools
         ])
         .setup(|app| {
             let window_builder = WindowBuilder::new(app, "main")
@@ -475,13 +608,15 @@ fn main() {
             let app_handle = app.handle().clone();
             thread::spawn(move || match connect_daemon() {
                 Ok(launch) => {
+                    let url = custom_ui_url(&launch.base, &launch.token)
+                        .unwrap_or(launch.url);
                     if let Some(state) = app_handle.try_state::<SharedDaemon>() {
                         *state.lock().unwrap() = Some(DaemonState {
                             base: launch.base,
                             token: launch.token,
                         });
                     }
-                    if let Err(e) = main_wv.navigate(launch.url) {
+                    if let Err(e) = main_wv.navigate(url) {
                         eprintln!("kimi-ui: 打开 web UI 失败：{e}");
                     }
                 }

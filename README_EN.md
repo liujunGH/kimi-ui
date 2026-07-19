@@ -62,8 +62,8 @@ The shell implements no Kimi functionality itself; it is just a launcher + a bro
 
 1. Runs `kimi server run` (idempotent: starts the daemon or reuses a running one)
 2. Reads the daemon's address and access credential from kimi's local data directory (same location and format the official client uses)
-3. Navigates the main webview there and completes the credential handoff the same way `kimi web --open` does
-4. The main webview gets an injected script for desktop behaviors (`Notification` polyfill, `window.focus()`, drag-region mirroring, etc.); the bottom status bar is the shell's own page, talking to the daemon directly over REST/WebSocket — it never touches the official page's DOM
+3. Serves a **customized kimi-web bundle** (from the fork [liujunGH/kimi-code](https://github.com/liujunGH/kimi-code), branch `kimi-ui`; one-command build via `scripts/build-web.sh`) on a tiny built-in static server (127.0.0.1:58628), and hands over both the credential and the daemon origin via the URL hash — the same shape the official flow uses. Falls back to the daemon-hosted UI if web-dist is missing
+4. The main webview gets an injected script only for desktop behaviors (`Notification` polyfill, `window.focus()`, drag-region mirroring, etc.); the bottom status bar is the shell's own page, talking to the daemon directly over REST/WebSocket
 
 ## Maintenance notes
 

@@ -59,12 +59,12 @@ rm ~/Library/LaunchAgents/dev.kimiui.desktop.plist
 
 ## 工作原理
 
-壳本身不实现任何 Kimi 功能，只做"启动器 + 浏览器"：
+壳本身不实现任何 Kimi 功能，只做"启动器 + 托管 + 浏览器"：
 
 1. 执行 `kimi server run`（幂等：daemon 未起则拉起，已起则复用）
 2. 从 kimi 的本地数据目录读取 daemon 的监听地址与访问凭据（位置与格式同官方客户端）
-3. 导航窗口到该地址，并按官方 Web UI 的标准方式完成凭据交接（与 `kimi web --open` 一致）
-4. 主 webview 通过注入脚本补齐桌面能力（`Notification` polyfill、`window.focus()`、拖拽区镜像等）；底部的原生状态栏是壳自己的页面，用 daemon 地址与凭据直连 REST/WebSocket，完全不碰官方页面 DOM
+3. 用内置静态服务（127.0.0.1:58628）托管**定制版 kimi-web**（来自 fork [liujunGH/kimi-code](https://github.com/liujunGH/kimi-code) 分支 `kimi-ui`，`scripts/build-web.sh` 一键构建），并按官方 Web UI 的标准方式完成凭据与 daemon 地址交接（URL hash）；web-dist 缺失时回退 daemon 内嵌的官方 UI
+4. 主 webview 里的注入脚本只补桌面能力（`Notification` polyfill、`window.focus()`、拖拽区镜像等）；底部状态栏是壳自己的页面，直连 daemon REST/WebSocket
 
 ## 维护说明
 

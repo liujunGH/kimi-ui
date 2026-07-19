@@ -1,13 +1,13 @@
 [package]
 name = "kimi-ui"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Minimal desktop shell for the Kimi Code web UI (system WebView, low memory)"
 
 [dependencies]
 # custom-protocol: makes WebviewUrl::App resolve to embedded assets in release
 # builds too (bare `cargo build` would otherwise assume a dev server URL).
-tauri = { version = "2", features = ["custom-protocol", "unstable", "macos-private-api"] }
+tauri = { version = "2", features = ["custom-protocol", "unstable", "macos-private-api", "devtools"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # Headless-TUI scraping (plan quota): spawn `kimi` in an embedded PTY and
