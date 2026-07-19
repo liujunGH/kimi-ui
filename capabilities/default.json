@@ -1,13 +1,17 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main window. The page is a REMOTE origin (the local kimi daemon), so remote.urls must cover it — otherwise every IPC invoke from the injected script is silently denied.",
+  "description": "Remote origins (the loopback-served customized UI). Remote content may only call explicitly granted commands; window drag + zoom internals plus the shell's own desktop-bridge commands.",
   "windows": ["main"],
   "remote": {
     "urls": ["http://127.0.0.1:*", "http://localhost:*"]
   },
   "permissions": [
     "core:window:allow-start-dragging",
-    "core:window:allow-internal-toggle-maximize"
+    "core:window:allow-internal-toggle-maximize",
+    "notification:default",
+    "allow-notify",
+    "allow-focus-window",
+    "allow-toggle-maximize"
   ]
 }

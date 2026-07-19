@@ -26,6 +26,10 @@ fi
 corepack pnpm@10.33.0 -C "$FORK" install --prefer-offline
 corepack pnpm@10.33.0 -C "$FORK/apps/kimi-web" run build
 
+# Stage atomically: a cargo build that runs while web-dist is being replaced
+# must never embed a half-copied bundle (that white-screens the app).
+rm -rf web-dist.tmp
+cp -R "$FORK/apps/kimi-web/dist" web-dist.tmp
 rm -rf web-dist
-cp -R "$FORK/apps/kimi-web/dist" web-dist
+mv web-dist.tmp web-dist
 echo "✓ web-dist/ updated from $FORK"

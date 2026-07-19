@@ -605,14 +605,25 @@ fn web_root() -> Option<PathBuf> {
 static EMBEDDED_WEB: include_dir::Dir<'static> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/web-dist");
 
+/// Recursively collect files from an embedded dir — `Dir::files()` is NOT
+/// recursive in include_dir 0.7 (subdirs live in `dirs()`), and without them
+/// every nested asset fell back to index.html and white-screened the app.
+#[cfg(not(debug_assertions))]
+fn collect_embedded(dir: &'static include_dir::Dir<'static>, out: &mut Vec<(String, &'static [u8])>) {
+    for f in dir.files() {
+        out.push((f.path().to_string_lossy().into_owned(), f.contents()));
+    }
+    for d in dir.dirs() {
+        collect_embedded(d, out);
+    }
+}
+
 /// Asset source for the customized UI: embedded into the exe in release.
 #[cfg(not(debug_assertions))]
 fn asset_source() -> Option<static_server::AssetSource> {
-    Some(static_server::AssetSource::from_memory(
-        EMBEDDED_WEB
-            .files()
-            .map(|f| (f.path().to_string_lossy().into_owned(), f.contents())),
-    ))
+    let mut files = Vec::new();
+    collect_embedded(&EMBEDDED_WEB, &mut files);
+    Some(static_server::AssetSource::from_memory(files))
 }
 
 /// Asset source for the customized UI: dev builds serve web-dist/ from disk,
@@ -797,6 +808,18 @@ fn toggle_devtools(app: tauri::AppHandle) {
         } else {
             wv.open_devtools();
         }
+        // The docked inspector changes the webview's frame to make room for
+        // itself, and on close the frame stays at FULL window height — the
+        // bottom of the page slides under the status strip. Re-assert our
+        // layout immediately and once more after the native frame change
+        // settles (it lands asynchronously).
+        layout_strip(&app);
+        let app2 = app.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            let app3 = app2.clone();
+            let _ = app2.run_on_main_thread(move || layout_strip(&app3));
+        });
     }
 }
 
@@ -1385,6 +1408,44 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK"), "response: {text:.200}");
         assert!(text.contains("text/html"), "response: {text:.200}");
         assert!(text.to_lowercase().contains("<html"), "response: {text:.200}");
+    }
+
+    /// The served index.html must reference assets the server can actually
+    /// deliver with a script-executable MIME — catches a broken/partial
+    /// asset source (e.g. non-recursive embed) that white-screens the app.
+    #[test]
+    fn serves_referenced_assets_with_correct_mime() {
+        use std::io::{Read, Write};
+        let source = asset_source().expect("asset source");
+        let port = crate::static_server::serve(source, 0).unwrap();
+        let get = |path: &str| -> String {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            String::from_utf8_lossy(&response).into_owned()
+        };
+        let index = get("/");
+        let asset = {
+            let start = index
+                .find("\"/assets/")
+                .map(|i| i + 1)
+                .or_else(|| index.find("\"./assets/").map(|i| i + 2))
+                .expect("index.html should reference an /assets/ bundle");
+            let rest = &index[start..];
+            rest[..rest.find('"').unwrap()].to_string()
+        };
+        let head = get(&asset);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{asset}: {head:.200}");
+        assert!(
+            head.contains("text/javascript"),
+            "{asset} must be executable JS, not the SPA fallback: {head:.200}"
+        );
     }
 
     #[test]

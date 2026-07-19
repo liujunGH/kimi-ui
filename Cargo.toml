@@ -1,6 +1,6 @@
 [package]
 name = "kimi-ui"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "Minimal desktop shell for the Kimi Code web UI (system WebView, low memory)"
 

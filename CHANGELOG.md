@@ -4,6 +4,13 @@
 打 `v*` tag 发版时，CI 自动截取对应段落作为 GitHub Release 的 notes；
 应用内"更新提示"卡片展示的也是这里的内容。版本说明一律使用中文。
 
+## 0.1.12 - 2026-07-19
+
+- 修复 release 白屏：嵌入资源收集改为递归（`include_dir` 的 `Dir::files()` 不含子目录，嵌套 JS/CSS 全部 404）；新增"index.html 引用资源必须可执行"回归测试拦截同类问题
+- 修复打开/关闭调试（Web Inspector）后窗口底部被状态条遮挡：原生检查器会撑改 webview 框架且不缩回，切换调试后强制重排布局
+- 修复远程源 ACL 静默拒绝自定义命令：通知 polyfill、`window.focus` 恢复可用，控制台 ACL 报错消除；`build.rs` 声明 app 命令清单，capabilities 按本地/远程来源拆分
+- 构建加固：web-dist 原子换装（防半成品被嵌入）、`build/` 暂存 + 原子安装（防半截包与 bundle id 撞车）、安装时自动结束旧实例
+
 ## 0.1.11 - 2026-07-19
 
 - web 资源编译期内嵌进可执行文件：macOS / Windows 均为单文件分发，不再附带 web 目录（开发时仍读磁盘 web-dist，改 web 不用重编译壳）
