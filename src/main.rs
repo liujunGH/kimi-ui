@@ -1,10 +1,17 @@
+// Prevents the black console window on Windows in release builds: without
+// this the linker marks the exe as console-subsystem and Windows attaches a
+// console at launch. Debug builds keep the console for log output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! kimi-ui: minimal desktop shell for the Kimi Code web UI.
 //!
 //! Launch flow:
 //!   1. open a window with a tiny local placeholder page immediately;
 //!   2. on a background thread, run `kimi server run` (spawns or reuses the
-//!      local daemon), then read host/port from `server/lock` and the bearer
-//!      token from `server.token` under $KIMI_CODE_HOME (default ~/.kimi-code);
+//!      local daemon), then discover a live daemon address — the
+//!      `server/instances/*.json` registry first, falling back to the legacy
+//!      `server/lock` — and read the bearer token from `server.token`
+//!      under $KIMI_CODE_HOME (default ~/.kimi-code);
 //!   3. navigate the main webview to `http://host:port/#token=<token>` (plus
 //!      `?kimi_desktop&platform=darwin` on macOS).
 //!
@@ -41,7 +48,8 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    net::{TcpStream, ToSocketAddrs},
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
@@ -284,10 +292,25 @@ struct Launch {
     url: Url,
 }
 
+/// Windows: spawn console-subsystem children (kimi.exe, gh.exe) without
+/// allocating a black console window. No-op on other platforms.
+fn no_console(cmd: Command) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = cmd;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        return cmd;
+    }
+    #[cfg(not(target_os = "windows"))]
+    cmd
+}
+
 /// Ensure the local daemon is running and discover its address/credentials.
 fn connect_daemon() -> Result<Launch, String> {
     let kimi = find_kimi().ok_or("找不到 kimi CLI，请先安装 Kimi Code")?;
-    let output = Command::new(kimi)
+    let output = no_console(Command::new(kimi))
         .args(["server", "run"])
         .output()
         .map_err(|e| format!("执行 `kimi server run` 失败：{e}"))?;
@@ -299,12 +322,25 @@ fn connect_daemon() -> Result<Launch, String> {
     }
 
     let home = kimi_home();
-    let lock_raw = fs::read_to_string(home.join("server/lock"))
-        .map_err(|e| format!("读取 server/lock 失败：{e}"))?;
-    let lock: Value =
-        serde_json::from_str(&lock_raw).map_err(|e| format!("解析 server/lock 失败：{e}"))?;
-    let host = lock["host"].as_str().unwrap_or("127.0.0.1");
-    let port = lock["port"].as_u64().unwrap_or(58627);
+    // `kimi server run` returns once the daemon is up; retry briefly in case
+    // the registry file lands a beat before the port starts listening.
+    let mut addr = None;
+    let mut last_err = String::new();
+    for attempt in 0..4 {
+        match discover_daemon(&home) {
+            Ok(a) => {
+                addr = Some(a);
+                break;
+            }
+            Err(e) => {
+                last_err = e;
+                if attempt < 3 {
+                    thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+    }
+    let addr = addr.ok_or(last_err)?;
 
     let token = fs::read_to_string(home.join("server.token"))
         .map_err(|e| format!("读取 server.token 失败（可先运行一次 `kimi web`）：{e}"))?;
@@ -315,11 +351,84 @@ fn connect_daemon() -> Result<Launch, String> {
     } else {
         ""
     };
-    let base = format!("http://{host}:{port}");
+    let base = format!("http://{}:{}", addr.host, addr.port);
     let url = format!("{base}/{desktop_query}#token={token}")
         .parse()
         .map_err(|e| format!("构造 web UI 地址失败：{e}"))?;
     Ok(Launch { base, token, url })
+}
+
+/// A reachable daemon address.
+struct DaemonAddr {
+    host: String,
+    port: u16,
+}
+
+/// Wildcard binds (`0.0.0.0` / `::`) are reached via loopback — mirrors
+/// kap-server's `normalizeHost` (apps/kimi-inspect/vite/serverDiscovery.ts).
+fn normalize_host(host: Option<&str>) -> String {
+    match host {
+        Some(h) if !h.is_empty() && h != "0.0.0.0" && h != "::" && h != "[::]" => h.to_string(),
+        _ => "127.0.0.1".to_string(),
+    }
+}
+
+/// TCP connect probe — answers "can we actually talk to this daemon", which
+/// is what the shell needs; unlike a pid-liveness check it behaves the same
+/// on every OS and is immune to pid reuse.
+fn tcp_alive(host: &str, port: u16) -> bool {
+    let Ok(mut addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
+}
+
+/// Discover a live daemon address: scan the multi-instance registry
+/// (`server/instances/*.json`, longest-running first), then fall back to the
+/// legacy single-instance `server/lock`. Mirrors kap-server's own discovery
+/// order (`packages/kap-server/src/instanceRegistry.ts`). Every candidate is
+/// verified with a TCP connect, so stale files from crashed daemons are
+/// skipped instead of fatal.
+fn discover_daemon(home: &Path) -> Result<DaemonAddr, String> {
+    let mut candidates: Vec<(u64, String, u16)> = Vec::new();
+
+    if let Ok(rd) = fs::read_dir(home.join("server/instances")) {
+        for entry in rd.flatten() {
+            if !entry.file_name().to_string_lossy().ends_with(".json") {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let Some(port) = v["port"].as_u64().and_then(|p| u16::try_from(p).ok()) else {
+                continue;
+            };
+            let started_at = v["started_at"].as_u64().unwrap_or(0);
+            candidates.push((started_at, normalize_host(v["host"].as_str()), port));
+        }
+    }
+    // Longest-running instance first (upstream sorts started_at ascending).
+    candidates.sort_by_key(|(started_at, _, _)| *started_at);
+
+    // Legacy lock: no comparable started_at (old builds wrote an ISO string),
+    // so it always sorts after every registry instance.
+    if let Ok(raw) = fs::read_to_string(home.join("server/lock")) {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(port) = v["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {
+                candidates.push((u64::MAX, normalize_host(v["host"].as_str()), port));
+            }
+        }
+    }
+
+    for (_, host, port) in candidates {
+        if tcp_alive(&host, port) {
+            return Ok(DaemonAddr { host, port });
+        }
+    }
+    Err("没有发现可达的 kimi daemon（server/instances 与 server/lock 均无效）".to_string())
 }
 
 /// Directory holding the customized kimi-web bundle (from the fork build):
@@ -601,7 +710,7 @@ fn version_newer(latest: &str, current: &str) -> bool {
 
 fn fetch_latest_release() -> Option<UpdateInfo> {
     let gh = find_executable("gh")?;
-    let out = Command::new(gh)
+    let out = no_console(Command::new(gh))
         .args([
             "api",
             "repos/liujunGH/kimi-ui/releases/latest",
@@ -954,5 +1063,124 @@ fn plan_usage() -> Value {
     match guard.as_ref().and_then(|g| g.as_ref()) {
         Some(u) => serde_json::to_value(u).unwrap_or_else(|_| Value::Null),
         None => serde_json::json!({ "loading": true }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kimi-ui-discovery-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("server/instances")).unwrap();
+        dir
+    }
+
+    /// A port with a live listener behind it.
+    fn live_port() -> (TcpListener, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    /// A port that is closed on loopback: bound to reserve, released on drop.
+    fn dead_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn prefers_longest_running_instance() {
+        let home = temp_home("multi");
+        let (_l1, p1) = live_port();
+        let (_l2, p2) = live_port();
+        fs::write(
+            home.join("server/instances/newer.json"),
+            format!(
+                r#"{{"server_id":"newer","pid":1,"host":"127.0.0.1","port":{p2},"started_at":200,"heartbeat_at":200}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("server/instances/older.json"),
+            format!(
+                r#"{{"server_id":"older","pid":1,"host":"127.0.0.1","port":{p1},"started_at":100,"heartbeat_at":100}}"#
+            ),
+        )
+        .unwrap();
+        let addr = discover_daemon(&home).unwrap();
+        assert_eq!(addr.port, p1);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn skips_dead_instance_and_falls_back_to_lock() {
+        let home = temp_home("fallback");
+        let (_listener, lock_port) = live_port();
+        fs::write(
+            home.join("server/instances/dead.json"),
+            format!(
+                r#"{{"server_id":"dead","pid":1,"host":"127.0.0.1","port":{},"started_at":1,"heartbeat_at":1}}"#,
+                dead_port()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("server/lock"),
+            format!(r#"{{"pid":1,"host":"127.0.0.1","port":{lock_port}}}"#),
+        )
+        .unwrap();
+        let addr = discover_daemon(&home).unwrap();
+        assert_eq!(addr.port, lock_port);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn lock_only_still_works() {
+        let home = temp_home("lock-only");
+        // The 0.26/0.27 lock shape: started_at is an ISO string, no instances dir.
+        fs::remove_dir_all(home.join("server/instances")).unwrap();
+        let (_listener, port) = live_port();
+        fs::write(
+            home.join("server/lock"),
+            format!(
+                r#"{{"pid":1,"started_at":"2026-07-16T16:52:51.702Z","host":"127.0.0.1","port":{port},"host_version":"0.27.0"}}"#
+            ),
+        )
+        .unwrap();
+        let addr = discover_daemon(&home).unwrap();
+        assert_eq!(addr.port, port);
+        assert_eq!(addr.host, "127.0.0.1");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn wildcard_host_normalizes_to_loopback() {
+        assert_eq!(normalize_host(Some("0.0.0.0")), "127.0.0.1");
+        assert_eq!(normalize_host(Some("::")), "127.0.0.1");
+        assert_eq!(normalize_host(Some("[::]")), "127.0.0.1");
+        assert_eq!(normalize_host(Some("")), "127.0.0.1");
+        assert_eq!(normalize_host(None), "127.0.0.1");
+        assert_eq!(normalize_host(Some("192.168.1.2")), "192.168.1.2");
+    }
+
+    #[test]
+    fn errors_when_nothing_is_reachable() {
+        let home = temp_home("empty");
+        fs::write(
+            home.join("server/lock"),
+            format!(r#"{{"pid":1,"host":"127.0.0.1","port":{}}}"#, dead_port()),
+        )
+        .unwrap();
+        assert!(discover_daemon(&home).is_err());
+        let _ = fs::remove_dir_all(&home);
     }
 }

@@ -40,7 +40,7 @@ cp -R "Kimi Code.app" /Applications/
 ## 工作原理
 
 1. 执行 `kimi server run`（幂等：daemon 未起则拉起，已起则复用）
-2. 从 kimi 本地数据目录读取 daemon 地址与访问凭据
+2. 从 kimi 本地数据目录发现 daemon 地址（`server/instances` 注册表优先，回退旧版 `server/lock`，TCP 探活跳过失效项）并读取访问凭据
 3. 内置静态服务（127.0.0.1:58628）托管定制 web 包，经 URL hash 完成凭据与 daemon 地址交接（与官方流程同构）；web-dist 缺失时回退 daemon 内嵌官方 UI
 4. 状态栏是壳自有页面，直连 daemon REST/WebSocket；注入脚本只补桌面能力（通知、拖拽等）
 
