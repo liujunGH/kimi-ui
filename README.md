@@ -1,92 +1,71 @@
 # kimi-ui
 
-[Kimi Code](https://www.kimi.com/code/) 官方 Web UI 的轻量桌面壳：Tauri 2 + 系统 WebView（macOS WKWebView），把 `kimi web` 变成一个独立桌面应用——不打包 Chromium，壳本身只占约 21MB 内存。
+[Kimi Code](https://www.kimi.com/code/) 的桌面端：**官方 daemon + 定制 web UI + 原生壳**。壳（本仓库）负责窗口、状态栏与系统集成；界面来自 fork 分支 [liujunGH/kimi-code `kimi-ui`](https://github.com/liujunGH/kimi-code/tree/kimi-ui) 构建的定制 kimi-web——滚动跟随、长会话性能、列表样式等体验问题都在源码级修复，不再依赖注入补丁。
 
-> A lightweight desktop shell for the Kimi Code web UI. Built with Tauri 2 and the system WebView (no bundled Chromium). The shell itself costs ~21MB of memory.
-> [English README](README_EN.md)
+> A desktop client for Kimi Code: the official daemon, a customized web UI (from our fork), and a native Tauri shell. [English README](README_EN.md)
 
 ## 特性
 
-- **独立应用形态**：独立窗口、Dock 图标、Cmd-Tab 直达、关窗即整体退出
-- **原生窗口装饰**（macOS）：hidden-inset 标题栏，红绿灯悬浮，配合官方 Web UI 的桌面布局；侧栏头部/聊天头部可直接拖动窗口（双击缩放/还原）
-- **原生通知**：补上了 WKWebView 缺失的 `Notification` API——任务完成/提问/审批三类提醒走 macOS 原生通知，点击回流激活窗口
-- **Dock 角标**：未读通知计数显示在 Dock 图标上，窗口聚焦自动清零
-- **原生状态栏**：窗口底部一条壳自己的状态栏（不占 SPA 区域、零遮挡）——实时显示上下文用量与模型；数据由状态栏直连 daemon REST/WebSocket 获取，与官方页面 DOM 零耦合，也是壳的拓展位
-- **额度统计**：状态栏右侧显示套餐额度（5 小时 / 每周）与重置倒计时；官方暂无公开端点，由壳定期在内嵌伪终端（PTY）里无头执行 TUI `/usage` 并解析渲染结果——零外部依赖，失败自动降级
-- **蜂群面板**：点状态栏的"蜂群"向上展开子代理实时名册——状态灯、swarmIndex、描述、结果摘要、token 用量（daemon `subagent.*` 事件流）
-- **思考流防爬屏**：流式思考块限高内滚，长推理不再把页面顶得一直往上爬
-- **下载支持**：会话导出等下载自动保存到 `~/Downloads`，重名自动追加 `(n)`
-- **外链处理**：外部链接一律交给系统浏览器
-- **界面自愈与自检**：有序列表两位数序号裁切修复；"内部测试"角标隐藏；官方界面结构变化时看门狗会提醒壳需要更新
-- **零守护负担**：daemon 无人连接 60 秒自动退出，壳不管生命周期；下次启动自动拉起或复用
-- **低内存**：壳主进程 ~26MB；整套（含 WebKit 服务进程、SPA 本体与状态栏小页）约 650MB，同 SPA 的 Electron 方案通常 900MB–1.2GB
+- **独立应用形态**：独立窗口、Dock 图标、Cmd-Tab、关窗即整体退出；hidden-inset 标题栏，拖拽区/双击缩放齐全
+- **定制 web UI**（fork 源码级优化）：滚动跟随只在主动回到底部时恢复；长会话工具组默认折叠、折叠即卸载、大输出尾部截断；流式只重渲变化的 turn；历史消息封顶 600 条
+- **原生状态栏**：上下文用量、套餐额度（5h/每周）、忙闲灯、蜂群名册（子代理实时状态）、跟随/静止开关、更新提示徽标
+- **原生通知 + Dock 角标**：完成/提问/审批走 macOS 通知，未读计数显示在 Dock
+- **下载与外链**：会话导出自动存 `~/Downloads` 去重；外部链接走系统浏览器
+- **界面自愈与三层看门狗**：官方改版导致 DOM/协议/格式漂移时明确告警，不静默坏掉
+- **低内存**：壳主进程 ~26MB；系统 WebView，不打包 Chromium
+- **CI 发版 + 更新提示**：Releases 直接下载 .app，应用内检测新版本
 
-## 要求
+## 安装
 
-- 已安装并登录 [Kimi Code CLI](https://www.kimi.com/code/docs/en/) ≥ 0.26（`kimi` 命令可用；web UI、token 均由它提供）
-- macOS 13+（代码含 Windows/Linux 分支但未实测）
-- 构建需要 Rust 工具链
+**推荐：下载即用**——[Releases](https://github.com/liujunGH/kimi-ui/releases) 页面下载 `kimi-ui-macos-arm64.zip`，解压后拖入 `/Applications`。
 
-## 使用
+前提只有一个：已安装并登录 [Kimi Code CLI](https://www.kimi.com/code/docs/en/)（`kimi` 命令可用，daemon、凭据都由它提供）。
 
-首次从源码构建运行：
+## 从源码构建
+
+需要 **两个仓库**（壳 + 定制 UI 源）：
 
 ```bash
-cargo build --release
-./target/release/kimi-ui
-```
+git clone https://github.com/liujunGH/kimi-ui.git
+git clone -b kimi-ui https://github.com/liujunGH/kimi-code.git
 
-打包成 `.app` 并安装（推荐，无需 tauri-cli）：
-
-```bash
-bash packaging/make-app.sh                 # 编译 + 组包 + ad-hoc 签名
+cd kimi-ui
+bash scripts/build-web.sh     # 构建定制 web 包到 web-dist/（pnpm + corepack）
+bash packaging/make-app.sh    # 编译壳 + 组包 + ad-hoc 签名
 cp -R "Kimi Code.app" /Applications/
 ```
 
-开机自启（可选）：
-
-```bash
-cp packaging/dev.kimiui.desktop.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kimiui.desktop.plist
-```
-
-卸载自启：
-
-```bash
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/dev.kimiui.desktop.plist
-rm ~/Library/LaunchAgents/dev.kimiui.desktop.plist
-```
+要求：Rust 工具链、Node ≥ 24.15（corepack 提供 pnpm）。
 
 ## 工作原理
 
-壳本身不实现任何 Kimi 功能，只做"启动器 + 托管 + 浏览器"：
-
 1. 执行 `kimi server run`（幂等：daemon 未起则拉起，已起则复用）
-2. 从 kimi 的本地数据目录读取 daemon 的监听地址与访问凭据（位置与格式同官方客户端）
-3. 用内置静态服务（127.0.0.1:58628）托管**定制版 kimi-web**（来自 fork [liujunGH/kimi-code](https://github.com/liujunGH/kimi-code) 分支 `kimi-ui`，`scripts/build-web.sh` 一键构建），并按官方 Web UI 的标准方式完成凭据与 daemon 地址交接（URL hash）；web-dist 缺失时回退 daemon 内嵌的官方 UI
-4. 主 webview 里的注入脚本只补桌面能力（`Notification` polyfill、`window.focus()`、拖拽区镜像等）；底部状态栏是壳自己的页面，直连 daemon REST/WebSocket
+2. 从 kimi 本地数据目录读取 daemon 地址与访问凭据
+3. 内置静态服务（127.0.0.1:58628）托管定制 web 包，经 URL hash 完成凭据与 daemon 地址交接（与官方流程同构）；web-dist 缺失时回退 daemon 内嵌官方 UI
+4. 状态栏是壳自有页面，直连 daemon REST/WebSocket；注入脚本只补桌面能力（通知、拖拽等）
+
+## 与上游的关系
+
+- fork 分支 `kimi-ui` 只改 `apps/kimi-web`，定期 rebase 上游 main
+- 通用修复会回提上游：[#1898](https://github.com/MoonshotAI/kimi-code/pull/1898)（列表序号）、[#1899](https://github.com/MoonshotAI/kimi-code/pull/1899)（滚动跟随）、[#1900](https://github.com/MoonshotAI/kimi-code/pull/1900)（长会话性能）
+- 壳专用改动（daemon 地址交接、相对资源路径）留在 fork，不提上游
 
 ## 维护说明
 
-本壳有多处与官方 Web UI 的 DOM/协议耦合点，官方改版可能导致对应功能退化（不会搞坏东西，只会退回原生行为）：
-
-- 拖拽区镜像：`.side.macos-desktop .ch`、`.chat-header.macos-desktop`
-- 角标隐藏：`.internal-build-tag`
-- 思考限高：`.tc-wrap:not(.is-collapsed) pre.tc`
-- 列表序号修复：`.md ol`
-- 状态栏：`/api/v1/sessions/*` REST 端点与 `subagent.*` 事件字段名（协议层，比 DOM 稳定）
-
-DOM 修复点都在 `src/main.rs` 的 `INIT_SCRIPT`，看门狗检测到结构变化时会主动提醒；状态栏代码在 `public/status.html`。
+DOM/协议耦合点的失效都有三层看门狗告警（拖拽布局、状态栏 REST/WS、额度抓屏格式），修复点在 `src/main.rs` 的 `INIT_SCRIPT` 与 fork 的对应组件；官方改版最坏情况是功能退回原生行为，不会静默出错。
 
 ## 目录结构
 
 ```
-src/main.rs            # 全部壳逻辑（窗口布局、注入脚本、下载、外链、命令）
+src/main.rs            # 壳逻辑（窗口布局、静态服务、注入脚本、命令、额度采集、更新检查）
+src/static_server.rs   # 零依赖静态服务（托管 web-dist）
 public/index.html      # 启动占位页
-public/status.html     # 原生状态栏（用量、模型、蜂群名册）
-capabilities/          # Tauri 窗口权限（拖拽 + 远程源 IPC）
+public/status.html     # 原生状态栏
+scripts/build-web.sh   # 从 fork 构建定制 web 包
 scripts/icon.swift     # 图标生成器
 packaging/             # Info.plist、make-app.sh、LaunchAgent plist
+.github/workflows/     # CI 发版
+capabilities/          # Tauri 窗口权限（拖拽 + 远程源 IPC）
 icons/                 # 生成的图标
 ```
 
