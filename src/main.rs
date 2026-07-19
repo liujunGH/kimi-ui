@@ -432,16 +432,19 @@ fn discover_daemon(home: &Path) -> Result<DaemonAddr, String> {
 }
 
 /// Directory holding the customized kimi-web bundle (from the fork build):
-/// `<exe>/../Resources/web` when packaged, `<project>/web-dist` in dev.
+/// `web/` next to the exe (Windows zip layout), `<exe>/../Resources/web`
+/// (macOS .app bundle), or `<project>/web-dist` in dev.
 fn web_root() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(res) = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("Resources/web"))
-        {
-            if res.is_dir() {
-                return Some(res);
+        if let Some(exe_dir) = exe.parent() {
+            let sibling = exe_dir.join("web");
+            if sibling.is_dir() {
+                return Some(sibling);
+            }
+            if let Some(res) = exe_dir.parent().map(|p| p.join("Resources/web")) {
+                if res.is_dir() {
+                    return Some(res);
+                }
             }
         }
     }
