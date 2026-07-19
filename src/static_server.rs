@@ -5,14 +5,23 @@
 //! like the official daemon-hosted flow (`/#token=...&daemon_base=...`).
 //! No dependencies — std::net only. GET only, per-connection threads, SPA
 //! fallback to index.html for client-side routes, path-traversal guarded.
+//!
+//! Assets come from an `AssetSource`: a directory on disk (dev builds) or an
+//! in-memory map (release builds embed web-dist/ into the exe for
+//! single-file distribution).
 
 use std::{
-    fs,
+    borrow::Cow,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::Path,
+    sync::Arc,
     thread,
 };
+#[cfg(debug_assertions)]
+use std::{fs, path::PathBuf};
+#[cfg(not(debug_assertions))]
+use std::collections::HashMap;
 
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
@@ -32,6 +41,61 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
+/// Where served assets come from.
+pub enum AssetSource {
+    /// A directory on disk (dev builds: the freshly built web-dist/).
+    #[cfg(debug_assertions)]
+    Dir(PathBuf),
+    /// In-memory map (release builds: web-dist/ embedded into the exe).
+    /// Keys are `/`-separated paths relative to the bundle root.
+    #[cfg(not(debug_assertions))]
+    Memory(HashMap<String, (&'static [u8], &'static str)>),
+}
+
+impl AssetSource {
+    /// Build an in-memory source from `(relative_path, bytes)` pairs.
+    #[cfg(not(debug_assertions))]
+    pub fn from_memory<I, S>(files: I) -> Self
+    where
+        I: IntoIterator<Item = (S, &'static [u8])>,
+        S: Into<String>,
+    {
+        let mut map = HashMap::new();
+        for (path, bytes) in files {
+            // Embedded dirs may carry platform separators; normalize.
+            let key = path.into().replace('\\', "/");
+            let key = key.strip_prefix("./").unwrap_or(&key).to_string();
+            let mime = content_type(Path::new(&key));
+            map.insert(key, (bytes, mime));
+        }
+        AssetSource::Memory(map)
+    }
+
+    /// Fetch an asset by URL path; SPA client-side routes fall back to
+    /// index.html. `None` only when even index.html is absent.
+    fn lookup(&self, url_path: &str) -> Option<(Cow<'_, [u8]>, &'static str)> {
+        match self {
+            #[cfg(debug_assertions)]
+            AssetSource::Dir(root) => {
+                let file = resolve(root, url_path);
+                fs::read(&file)
+                    .ok()
+                    .map(|body| (Cow::Owned(body), content_type(&file)))
+            }
+            #[cfg(not(debug_assertions))]
+            AssetSource::Memory(map) => {
+                let clean = url_path.trim_start_matches('/');
+                let clean = if clean.is_empty() { "index.html" } else { clean };
+                map.get(clean)
+                    .or_else(|| map.get(&format!("{clean}/index.html")))
+                    .or_else(|| map.get("index.html"))
+                    .map(|(body, mime)| (Cow::Borrowed(*body), *mime))
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
 fn resolve(root: &Path, url_path: &str) -> PathBuf {
     let clean = url_path.trim_start_matches('/');
     let mut candidate = root.join(clean);
@@ -45,7 +109,7 @@ fn resolve(root: &Path, url_path: &str) -> PathBuf {
     candidate
 }
 
-fn handle(mut stream: TcpStream, root: &Path) {
+fn handle(mut stream: TcpStream, source: &AssetSource) {
     let mut buf = [0u8; 8192];
     let Ok(n) = stream.read(&mut buf) else { return };
     let request = String::from_utf8_lossy(&buf[..n]);
@@ -80,12 +144,10 @@ fn handle(mut stream: TcpStream, root: &Path) {
         return;
     }
 
-    let file = resolve(root, &normalized);
-    match fs::read(&file) {
-        Ok(body) => {
+    match source.lookup(&normalized) {
+        Some((body, mime)) => {
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n\r\n",
-                content_type(&file),
+                "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n\r\n",
                 body.len()
             );
             let _ = stream.write_all(head.as_bytes());
@@ -93,23 +155,24 @@ fn handle(mut stream: TcpStream, root: &Path) {
                 let _ = stream.write_all(&body);
             }
         }
-        Err(_) => {
+        None => {
             let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
         }
     }
 }
 
-/// Serve `root` on 127.0.0.1 in the background; returns the bound port.
+/// Serve `source` on 127.0.0.1 in the background; returns the bound port.
 /// Falls back to an OS-assigned port when the preferred one is taken.
-pub fn serve(root: PathBuf, preferred_port: u16) -> std::io::Result<u16> {
+pub fn serve(source: AssetSource, preferred_port: u16) -> std::io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", preferred_port))
         .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))?;
     let port = listener.local_addr()?.port();
+    let source = Arc::new(source);
     thread::spawn(move || {
         for stream in listener.incoming() {
             if let Ok(stream) = stream {
-                let root = root.clone();
-                thread::spawn(move || handle(stream, &root));
+                let source = Arc::clone(&source);
+                thread::spawn(move || handle(stream, &source));
             }
         }
     });

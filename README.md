@@ -39,10 +39,10 @@ cp -R "Kimi Code.app" /Applications/
 
 ## 工作原理
 
-1. 执行 `kimi server run`（幂等：daemon 未起则拉起，已起则复用）
-2. 从 kimi 本地数据目录发现 daemon 地址（`server/instances` 注册表优先，回退旧版 `server/lock`，TCP 探活跳过失效项）并读取访问凭据
-3. 内置静态服务（127.0.0.1:58628）托管定制 web 包，经 URL hash 完成凭据与 daemon 地址交接（与官方流程同构）；web-dist 缺失时回退 daemon 内嵌官方 UI
-4. 状态栏是壳自有页面，直连 daemon REST/WebSocket；注入脚本只补桌面能力（通知、拖拽等）
+1. 检查 kimi CLI 是否安装及版本（< 0.26 引导 `kimi upgrade`，未安装引导官方文档）
+2. 发现已有服务实例则直接 attach；否则旧版 CLI 走 `kimi server run`、新版 CLI 后台拉起 `kimi web --no-open`（App 退出时回收），再从 `server/instances` 注册表（回退旧版 `server/lock`，TCP 探活跳过失效项）发现地址、读取访问凭据
+3. 内置静态服务（127.0.0.1:58628）托管定制 web 包（release 编译期内嵌进 exe，单文件分发；开发时从 web-dist 磁盘读取），经 URL hash 完成凭据与 daemon 地址交接（与官方流程同构）；包缺失时回退 daemon 内嵌官方 UI
+4. 状态栏是壳自有页面，直连 daemon REST/WebSocket；注入脚本只补桌面能力（通知、拖拽等）；更新提示带版本说明（Release notes 由 CI 自动生成）
 
 ## 与上游的关系
 
@@ -72,3 +72,5 @@ icons/                 # 生成的图标
 ## License
 
 [MIT](LICENSE)
+
+版本说明见 [CHANGELOG.md](CHANGELOG.md)（发版自动引用），项目协作规范见 [AGENTS.md](AGENTS.md)。

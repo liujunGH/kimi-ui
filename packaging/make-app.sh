@@ -7,20 +7,19 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="Kimi Code.app"
 
-cargo build --release
-
-# Customized kimi-web bundle (from the fork); build it first if missing.
+# Customized kimi-web bundle (from the fork) is embedded into the release
+# binary at compile time; it must exist before `cargo build`.
 if [ ! -d web-dist ]; then
   echo "error: web-dist/ missing — run scripts/build-web.sh first" >&2
   exit 1
 fi
 
+cargo build --release
+
 rm -rf "$APP_NAME"
 mkdir -p "$APP_NAME/Contents/MacOS" "$APP_NAME/Contents/Resources"
 cp target/release/kimi-ui "$APP_NAME/Contents/MacOS/kimi-ui"
 cp packaging/Info.plist "$APP_NAME/Contents/Info.plist"
-rm -rf "$APP_NAME/Contents/Resources/web"
-cp -R web-dist "$APP_NAME/Contents/Resources/web"
 
 ICONSET=icons/icon.iconset
 rm -rf "$ICONSET"

@@ -7,13 +7,18 @@
 //!
 //! Launch flow:
 //!   1. open a window with a tiny local placeholder page immediately;
-//!   2. on a background thread, run `kimi server run` (spawns or reuses the
-//!      local daemon), then discover a live daemon address — the
-//!      `server/instances/*.json` registry first, falling back to the legacy
-//!      `server/lock` — and read the bearer token from `server.token`
-//!      under $KIMI_CODE_HOME (default ~/.kimi-code);
-//!   3. navigate the main webview to `http://host:port/#token=<token>` (plus
-//!      `?kimi_desktop&platform=darwin` on macOS).
+//!   2. on a background thread, attach to an already-running server if one
+//!      exists; otherwise ensure one — legacy `kimi server run` on older
+//!      CLIs, or a spawned `kimi web --no-open` child (killed on app exit)
+//!      on newer ones. Discover the address from `server/instances/*.json`
+//!      first, falling back to the legacy `server/lock`, and read the bearer
+//!      token from `server.token` under $KIMI_CODE_HOME (default
+//!      ~/.kimi-code). kimi is version-gated (≥ 0.26); missing or outdated
+//!      installs get a guided error page;
+//!   3. navigate the main webview to the customized UI on the loopback
+//!      static server (127.0.0.1:58628) — the fork-built web bundle,
+//!      embedded into the exe in release builds and served from disk in
+//!      dev — with token and daemon origin handed over via the URL hash.
 //!
 //! Window layout (nothing shifts the SPA):
 //!   - a bare window holds two child webviews;
@@ -50,7 +55,7 @@ use std::{
     fs,
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
         Mutex,
@@ -307,43 +312,93 @@ fn no_console(cmd: Command) -> Command {
     cmd
 }
 
-/// Ensure the local daemon is running and discover its address/credentials.
-fn connect_daemon() -> Result<Launch, String> {
-    let kimi = find_kimi().ok_or("找不到 kimi CLI，请先安装 Kimi Code")?;
-    let output = no_console(Command::new(kimi))
-        .args(["server", "run"])
-        .output()
-        .map_err(|e| format!("执行 `kimi server run` 失败：{e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`kimi server run` 退出码非零：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+/// Oldest kimi CLI the shell can drive: older builds lack the server
+/// commands (`kimi server run` / `kimi web`) the launch flow needs.
+const MIN_KIMI_VERSION: &str = "0.26.0";
+
+/// Structured boot failure; the placeholder page renders it as guided steps.
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BootError {
+    /// kimi CLI not found on PATH or in well-known install spots.
+    KimiMissing,
+    /// kimi found but older than `min`.
+    KimiTooOld { version: String, min: String },
+    /// No reachable server came up; `detail` says what was tried.
+    DaemonUnreachable {
+        detail: String,
+        version: Option<String>,
+    },
+}
+
+/// The `kimi web` child we spawned ourselves (step 3 below); killed on app
+/// exit so it does not outlive us — mirrors the old daemon's idle exit.
+static SPAWNED_SERVER: Mutex<Option<Child>> = Mutex::new(None);
+
+/// Ensure a local server is running and build its address/credentials.
+///
+///   1. attach to an already-running server (the user's own `kimi web`, or a
+///      daemon from an older CLI) — no subprocess at all;
+///   2. legacy `kimi server run` (≤ 0.27) spawns/reuses a background daemon;
+///      newer CLIs print a deprecation notice and exit 1, which just falls
+///      through;
+///   3. spawn `kimi web --no-open` ourselves and wait (≤15s, bailing early
+///      if the child dies) for it to register under `server/instances/`.
+fn connect_daemon() -> Result<Launch, BootError> {
+    let kimi = find_kimi().ok_or(BootError::KimiMissing)?;
+    let version = kimi_version(&kimi);
+    if let Some(v) = &version {
+        if version_older(v, MIN_KIMI_VERSION) {
+            return Err(BootError::KimiTooOld {
+                version: v.clone(),
+                min: MIN_KIMI_VERSION.to_string(),
+            });
+        }
     }
 
     let home = kimi_home();
-    // `kimi server run` returns once the daemon is up; retry briefly in case
-    // the registry file lands a beat before the port starts listening.
-    let mut addr = None;
-    let mut last_err = String::new();
-    for attempt in 0..4 {
-        match discover_daemon(&home) {
-            Ok(a) => {
-                addr = Some(a);
-                break;
-            }
-            Err(e) => {
-                last_err = e;
-                if attempt < 3 {
-                    thread::sleep(Duration::from_millis(300));
-                }
-            }
+    if let Ok(launch) = attach(&home) {
+        return Ok(launch);
+    }
+
+    let legacy_ok = no_console(Command::new(&kimi))
+        .args(["server", "run"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if legacy_ok {
+        if let Ok(launch) = attach_with_retry(&home, 4, Duration::from_millis(300)) {
+            return Ok(launch);
         }
     }
-    let addr = addr.ok_or(last_err)?;
 
+    let mut child = spawn_web_server(&kimi).map_err(|e| BootError::DaemonUnreachable {
+        detail: format!("拉起 `kimi web --no-open` 失败：{e}"),
+        version: version.clone(),
+    })?;
+    match wait_attach(&home, &mut child, 50, Duration::from_millis(300)) {
+        Ok(launch) => {
+            if let Ok(mut guard) = SPAWNED_SERVER.lock() {
+                *guard = Some(child);
+            }
+            Ok(launch)
+        }
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(BootError::DaemonUnreachable {
+                detail: e,
+                version,
+            })
+        }
+    }
+}
+
+/// Attach to a reachable daemon (single attempt) and build the launch params.
+fn attach(home: &Path) -> Result<Launch, String> {
+    let addr = discover_daemon(home)?;
     let token = fs::read_to_string(home.join("server.token"))
-        .map_err(|e| format!("读取 server.token 失败（可先运行一次 `kimi web`）：{e}"))?;
+        .map_err(|e| format!("读取 server.token 失败：{e}"))?;
     let token = token.trim().to_string();
 
     let desktop_query = if cfg!(target_os = "macos") {
@@ -356,6 +411,97 @@ fn connect_daemon() -> Result<Launch, String> {
         .parse()
         .map_err(|e| format!("构造 web UI 地址失败：{e}"))?;
     Ok(Launch { base, token, url })
+}
+
+/// `attach()` with retries — a freshly spawned server needs a moment before
+/// its registry file and port are live.
+fn attach_with_retry(home: &Path, attempts: u32, interval: Duration) -> Result<Launch, String> {
+    let mut last_err = String::new();
+    for attempt in 0..attempts {
+        match attach(home) {
+            Ok(launch) => return Ok(launch),
+            Err(e) => {
+                last_err = e;
+                if attempt + 1 < attempts {
+                    thread::sleep(interval);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Poll `attach` until the spawned server registers (bounded by
+/// `attempts × interval`); bails early with the child's captured stderr when
+/// the child exits before becoming reachable.
+fn wait_attach(
+    home: &Path,
+    child: &mut Child,
+    attempts: u32,
+    interval: Duration,
+) -> Result<Launch, String> {
+    let mut last_err = String::new();
+    for attempt in 0..attempts {
+        match attach(home) {
+            Ok(launch) => return Ok(launch),
+            Err(e) => last_err = e,
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let log = fs::read_to_string(web_stderr_log()).unwrap_or_default();
+            let tail: String = log
+                .chars()
+                .skip(log.chars().count().saturating_sub(600))
+                .collect();
+            return Err(format!("`kimi web` 提前退出（{status}）：{}", tail.trim()));
+        }
+        if attempt + 1 < attempts {
+            thread::sleep(interval);
+        }
+    }
+    Err(format!("等待服务就绪超时：{last_err}"))
+}
+
+/// Temp file capturing the spawned server's stderr (read back on failure).
+fn web_stderr_log() -> PathBuf {
+    std::env::temp_dir().join("kimi-ui-web-server.log")
+}
+
+/// Spawn `kimi web --no-open` as a background child (new-style CLIs have no
+/// daemon manager; the foreground server stays up while the child lives).
+/// stderr goes to a temp log so `wait_attach` can report why a boot failed.
+fn spawn_web_server(kimi: &Path) -> Result<Child, String> {
+    let log = fs::File::create(web_stderr_log()).map_err(|e| e.to_string())?;
+    no_console(Command::new(kimi))
+        .args(["web", "--no-open"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .map_err(|e| e.to_string())
+}
+
+/// `kimi --version` → e.g. "0.27.0". Best-effort: None when unparseable.
+fn kimi_version(kimi: &Path) -> Option<String> {
+    let out = no_console(Command::new(kimi)).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_kimi_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse a bare semver from `--version` stdout; rejects anything fancier.
+fn parse_kimi_version(stdout: &str) -> Option<String> {
+    let v = stdout.trim();
+    let valid = !v.is_empty()
+        && v
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    valid.then(|| v.to_string())
+}
+
+/// Strict semver-ish less-than; equal is not older.
+fn version_older(v: &str, min: &str) -> bool {
+    version_newer(min, v)
 }
 
 /// A reachable daemon address.
@@ -431,9 +577,10 @@ fn discover_daemon(home: &Path) -> Result<DaemonAddr, String> {
     Err("没有发现可达的 kimi daemon（server/instances 与 server/lock 均无效）".to_string())
 }
 
-/// Directory holding the customized kimi-web bundle (from the fork build):
-/// `web/` next to the exe (Windows zip layout), `<exe>/../Resources/web`
-/// (macOS .app bundle), or `<project>/web-dist` in dev.
+/// Dev-only: the customized kimi-web bundle (fork build) on disk —
+/// `web/` next to the exe, `<exe>/../Resources/web`, or `<project>/web-dist`.
+/// Release builds embed the bundle into the exe instead (see asset_source()).
+#[cfg(debug_assertions)]
 fn web_root() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
@@ -452,12 +599,34 @@ fn web_root() -> Option<PathBuf> {
     dev.is_dir().then_some(dev)
 }
 
+/// web-dist/ embedded into the release exe — single-file distribution, no
+/// sibling folder to locate at runtime.
+#[cfg(not(debug_assertions))]
+static EMBEDDED_WEB: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/web-dist");
+
+/// Asset source for the customized UI: embedded into the exe in release.
+#[cfg(not(debug_assertions))]
+fn asset_source() -> Option<static_server::AssetSource> {
+    Some(static_server::AssetSource::from_memory(
+        EMBEDDED_WEB
+            .files()
+            .map(|f| (f.path().to_string_lossy().into_owned(), f.contents())),
+    ))
+}
+
+/// Asset source for the customized UI: dev builds serve web-dist/ from disk,
+/// so web rebuilds don't need a cargo rebuild.
+#[cfg(debug_assertions)]
+fn asset_source() -> Option<static_server::AssetSource> {
+    web_root().map(static_server::AssetSource::Dir)
+}
+
 /// URL of the customized UI served by our loopback static server, with the
 /// token and live daemon origin handed over via the URL hash (same handoff
 /// shape the official daemon-hosted flow uses).
 fn custom_ui_url(base: &str, token: &str) -> Option<Url> {
-    let root = web_root()?;
-    let port = static_server::serve(root, 58628).ok()?;
+    let port = static_server::serve(asset_source()?, 58628).ok()?;
     let enc_base = base.replace(':', "%3A").replace('/', "%2F");
     let desktop_query = if cfg!(target_os = "macos") {
         "?kimi_desktop&platform=darwin"
@@ -681,6 +850,8 @@ struct UpdateInfo {
     latest: String,
     url: String,
     has_update: bool,
+    /// Release notes (markdown), rendered by the status page's update card.
+    notes: String,
 }
 
 static UPDATE_INFO: Mutex<Option<UpdateInfo>> = Mutex::new(None);
@@ -714,22 +885,19 @@ fn version_newer(latest: &str, current: &str) -> bool {
 fn fetch_latest_release() -> Option<UpdateInfo> {
     let gh = find_executable("gh")?;
     let out = no_console(Command::new(gh))
-        .args([
-            "api",
-            "repos/liujunGH/kimi-ui/releases/latest",
-            "--jq",
-            ".tag_name + \" \" + .html_url",
-        ])
+        .args(["api", "repos/liujunGH/kimi-ui/releases/latest"])
         .output()
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
-    let (tag, url) = out.split_once(' ')?;
-    let latest = tag.trim_start_matches('v').to_string();
+        .filter(|o| o.status.success())?;
+    let json: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let latest = json["tag_name"].as_str()?.trim_start_matches('v').to_string();
+    let url = json["html_url"].as_str()?.to_string();
+    let notes = json["body"].as_str().unwrap_or("").trim().to_string();
     Some(UpdateInfo {
         has_update: version_newer(&latest, env!("CARGO_PKG_VERSION")),
         latest,
-        url: url.to_string(),
+        url,
+        notes,
     })
 }
 
@@ -831,16 +999,28 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    let msg = serde_json::to_string(&format!("启动失败：{e}"))
-                        .unwrap_or_else(|_| "\"启动失败\"".to_string());
+                    let msg = serde_json::to_string(&e)
+                        .unwrap_or_else(|_| "{\"kind\":\"unknown\"}".to_string());
                     let _ = main_wv.eval(&format!("window.__kimiBootError({msg})"));
                 }
             });
             start_update_check();
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running kimi-ui");
+        .build(tauri::generate_context!())
+        .expect("error while building kimi-ui")
+        .run(|_app, event| {
+            // Kill the `kimi web` child we spawned (if any) so it does not
+            // outlive the shell — mirrors the old daemon's idle exit.
+            if let tauri::RunEvent::Exit = event {
+                if let Ok(mut guard) = SPAWNED_SERVER.lock() {
+                    if let Some(mut child) = guard.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,5 +1365,43 @@ mod tests {
         .unwrap();
         assert!(discover_daemon(&home).is_err());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Serves index.html over HTTP from the active asset source — disk in
+    /// debug, embedded-in-exe in release (run `cargo test --release` to
+    /// exercise the embedded path).
+    #[test]
+    fn serves_index_html_over_http() {
+        use std::io::{Read, Write};
+        let source = asset_source().expect("asset source");
+        let port = crate::static_server::serve(source, 0).unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "response: {text:.200}");
+        assert!(text.contains("text/html"), "response: {text:.200}");
+        assert!(text.to_lowercase().contains("<html"), "response: {text:.200}");
+    }
+
+    #[test]
+    fn parses_bare_semver_only() {
+        assert_eq!(parse_kimi_version("0.27.0\n"), Some("0.27.0".to_string()));
+        assert_eq!(parse_kimi_version("  1.2.3  "), Some("1.2.3".to_string()));
+        assert_eq!(parse_kimi_version("v0.27.0"), None);
+        assert_eq!(parse_kimi_version("0.27.0-beta"), None);
+        assert_eq!(parse_kimi_version(""), None);
+    }
+
+    #[test]
+    fn enforces_minimum_kimi_version() {
+        assert!(version_older("0.25.9", MIN_KIMI_VERSION));
+        assert!(!version_older("0.26.0", MIN_KIMI_VERSION));
+        assert!(!version_older("0.26.1", MIN_KIMI_VERSION));
+        assert!(!version_older("0.27.0", MIN_KIMI_VERSION));
+        assert!(!version_older("1.0.0", MIN_KIMI_VERSION));
     }
 }

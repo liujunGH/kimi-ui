@@ -80,6 +80,23 @@
       .card.show { display: block; }
       #usageCard { left: 8px; width: 250px; }
       #swarmCard { right: 8px; width: 320px; max-height: 280px; overflow-y: auto; }
+      #updateCard { right: 8px; width: 360px; max-height: 320px; overflow-y: auto; }
+      #updateCard h3 { margin: 2px 0 8px; font-size: 13px; }
+      #updateCard pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1.6;
+        margin: 0;
+      }
+      #updateCard .go {
+        display: inline-block;
+        margin-top: 10px;
+        color: var(--accent);
+        font-weight: 600;
+        cursor: pointer;
+      }
       .row { display: flex; justify-content: space-between; padding: 2px 0; }
       .row .k { color: var(--dim); }
       .agent { padding: 5px 0; border-top: 1px solid var(--border); }
@@ -93,6 +110,7 @@
     <div id="backdrop"></div>
     <div id="usageCard" class="card"></div>
     <div id="swarmCard" class="card"></div>
+    <div id="updateCard" class="card"></div>
     <div id="bar">
       <span id="dot"></span>
       <span id="usage">…</span>
@@ -135,9 +153,12 @@
         document.getElementById('backdrop').className = mode === 'none' ? '' : 'show';
         document.getElementById('usageCard').className = 'card' + (mode === 'usage' ? ' show' : '');
         document.getElementById('swarmCard').className = 'card' + (mode === 'swarm' ? ' show' : '');
+        document.getElementById('updateCard').className = 'card' + (mode === 'update' ? ' show' : '');
         document.getElementById('swarmBtn').className = 'btn' + (mode === 'swarm' ? ' active' : '');
+        document.getElementById('updateBadge').className = 'btn' + (mode === 'update' ? ' active' : '');
         if (mode === 'usage') renderUsageCard();
         if (mode === 'swarm') renderSwarm();
+        if (mode === 'update') renderUpdate();
       }
       document.getElementById('backdrop').onclick = function () { setMode('none'); };
       document.getElementById('usage').onclick = function () {
@@ -204,14 +225,34 @@
       pollPlanUsage();
       setInterval(pollPlanUsage, 60000);
 
-      // ---- update check (shows a badge when a newer release exists) ----
+      // ---- update check (badge -> overlay card with the release notes) ----
+      var updateInfo = null;
+      function renderUpdate() {
+        var d = updateInfo;
+        if (!d) return;
+        var card = document.getElementById('updateCard');
+        card.innerHTML = '';
+        var h = document.createElement('h3');
+        h.textContent = '新版本 v' + d.latest;
+        card.appendChild(h);
+        var pre = document.createElement('pre');
+        pre.textContent = d.notes && d.notes.trim() ? d.notes : '（该版本未提供版本说明）';
+        card.appendChild(pre);
+        var go = document.createElement('span');
+        go.className = 'go';
+        go.textContent = '前往下载 →';
+        go.onclick = function () { invoke('open_url', { url: d.url }); };
+        card.appendChild(go);
+      }
       function pollUpdate() {
         invoke('update_info').then(function (d) {
           var el = document.getElementById('updateBadge');
           if (d && d.has_update) {
+            updateInfo = d;
             el.style.display = '';
             el.textContent = '⬆ ' + d.latest;
-            el.onclick = function () { invoke('open_url', { url: d.url }); };
+            el.title = '查看更新内容';
+            el.onclick = function () { setMode(mode === 'update' ? 'none' : 'update'); };
           }
         }).catch(function () {});
       }

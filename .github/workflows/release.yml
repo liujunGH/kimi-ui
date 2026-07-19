@@ -38,10 +38,17 @@ jobs:
       - name: Zip the app bundle
         run: ditto -c -k --sequesterRsrc --keepParent "Kimi Code.app" kimi-ui-macos-arm64.zip
 
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## " v " " {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "本版本无单独版本说明，详见提交历史。" > notes.md
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: kimi-ui-macos-arm64.zip
+          body_path: notes.md
 
   windows:
     runs-on: windows-latest
@@ -73,10 +80,16 @@ jobs:
         run: |
           mkdir -p dist/KimiUI
           cp target/release/kimi-ui.exe dist/KimiUI/
-          cp -R web-dist dist/KimiUI/web
           cd dist && 7z a ../kimi-ui-windows-x64.zip KimiUI
+
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## " v " " {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "本版本无单独版本说明，详见提交历史。" > notes.md
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: kimi-ui-windows-x64.zip
+          body_path: notes.md

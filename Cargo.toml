@@ -1,6 +1,6 @@
 [package]
 name = "kimi-ui"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "Minimal desktop shell for the Kimi Code web UI (system WebView, low memory)"
 
@@ -10,6 +10,8 @@ description = "Minimal desktop shell for the Kimi Code web UI (system WebView, l
 tauri = { version = "2", features = ["custom-protocol", "unstable", "macos-private-api", "devtools"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+# Release builds embed web-dist/ into the exe (single-file distribution).
+include_dir = "0.7"
 # Headless-TUI scraping (plan quota): spawn `kimi` in an embedded PTY and
 # reproduce the rendered screen — no external tmux dependency.
 portable-pty = "0.8"

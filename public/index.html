@@ -34,8 +34,34 @@
         color: #f85149;
         max-width: 72%;
         line-height: 1.7;
-        white-space: pre-wrap;
         display: none;
+      }
+      #err h2 {
+        color: #f0f6fc;
+        font-size: 16px;
+        margin: 0 0 6px;
+      }
+      #err p {
+        margin: 4px 0;
+      }
+      #err ol {
+        margin: 10px 0 0;
+        padding-left: 1.4em;
+        line-height: 2;
+        color: #8b949e;
+      }
+      #err code {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 2px 8px;
+        margin-left: 4px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+        color: #79c0ff;
+      }
+      #err a {
+        color: #58a6ff;
       }
     </style>
   </head>
@@ -44,12 +70,74 @@
     <div id="status">正在启动 Kimi Code…</div>
     <div id="err"></div>
     <script>
-      window.__kimiBootError = function (msg) {
+      const GUIDES = {
+        kimi_missing: {
+          title: "未检测到 Kimi Code CLI",
+          steps: [
+            { text: "先安装 Kimi Code（见官方文档）：", link: "https://moonshotai.github.io/kimi-code/" },
+            { text: "安装完成后重开本应用" },
+          ],
+        },
+        kimi_too_old: {
+          title: "Kimi Code 版本过旧",
+          steps: [
+            { text: "终端执行升级：", code: "kimi upgrade" },
+            { text: "升级完成后重开本应用" },
+          ],
+        },
+        daemon_unreachable: {
+          title: "本地服务启动失败",
+          steps: [
+            { text: "在终端手动运行查看原因：", code: "kimi web" },
+            { text: "若有残留实例，可先执行：", code: "kimi web kill" },
+          ],
+        },
+      };
+      window.__kimiBootError = function (payload) {
         document.getElementById("spinner").style.display = "none";
         document.getElementById("status").style.display = "none";
         const err = document.getElementById("err");
         err.style.display = "block";
-        err.textContent = msg;
+        err.textContent = "";
+        if (typeof payload === "string" || !payload || !payload.kind) {
+          err.textContent = typeof payload === "string" ? payload : "启动失败";
+          return;
+        }
+        const g = GUIDES[payload.kind] || { title: "启动失败", steps: [] };
+        const h = document.createElement("h2");
+        h.textContent = g.title;
+        err.appendChild(h);
+        if (payload.kind === "kimi_too_old") {
+          const p = document.createElement("p");
+          p.textContent = `当前版本 v${payload.version}，需要 ≥ v${payload.min}`;
+          err.appendChild(p);
+        }
+        if (payload.detail) {
+          const p = document.createElement("p");
+          p.textContent = payload.detail;
+          err.appendChild(p);
+        }
+        if (g.steps.length) {
+          const ol = document.createElement("ol");
+          for (const s of g.steps) {
+            const li = document.createElement("li");
+            li.append(s.text);
+            if (s.code) {
+              const c = document.createElement("code");
+              c.textContent = s.code;
+              li.appendChild(c);
+            }
+            if (s.link) {
+              const a = document.createElement("a");
+              a.href = s.link;
+              a.textContent = s.link;
+              a.target = "_blank";
+              li.appendChild(a);
+            }
+            ol.appendChild(li);
+          }
+          err.appendChild(ol);
+        }
       };
     </script>
   </body>
