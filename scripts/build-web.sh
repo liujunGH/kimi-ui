@@ -23,8 +23,8 @@ if ! command -v corepack >/dev/null 2>&1; then
   exit 1
 fi
 
-corepack pnpm -C "$FORK" install --prefer-offline
-corepack pnpm -C "$FORK/apps/kimi-web" run build
+corepack pnpm@10.33.0 -C "$FORK" install --prefer-offline
+corepack pnpm@10.33.0 -C "$FORK/apps/kimi-web" run build
 
 rm -rf web-dist
 cp -R "$FORK/apps/kimi-web/dist" web-dist
