@@ -216,19 +216,27 @@ fn kimi_home() -> PathBuf {
 /// Locate the `kimi` binary. GUI apps launched from Finder get a minimal PATH,
 /// so fall back to well-known install locations.
 fn find_kimi() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    const EXE: &str = "kimi.exe";
+    #[cfg(not(target_os = "windows"))]
+    const EXE: &str = "kimi";
+
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("kimi");
+            let candidate = dir.join(EXE);
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
+    #[cfg(not(target_os = "windows"))]
     let candidates = [
         home_dir().join(".kimi-code/bin/kimi"),
         PathBuf::from("/opt/homebrew/bin/kimi"),
         PathBuf::from("/usr/local/bin/kimi"),
     ];
+    #[cfg(target_os = "windows")]
+    let candidates = [home_dir().join(".kimi-code/bin").join(EXE)];
     candidates.into_iter().find(|p| p.is_file())
 }
 

@@ -42,3 +42,41 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: kimi-ui-macos-arm64.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout the kimi-code fork (web bundle source)
+        uses: actions/checkout@v4
+        with:
+          repository: liujunGH/kimi-code
+          ref: kimi-ui
+          path: kimi-code
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build the customized web bundle (web-dist/)
+        env:
+          KIMI_CODE_FORK: ${{ github.workspace }}/kimi-code
+        run: bash scripts/build-web.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir -p dist/KimiUI
+          cp target/release/kimi-ui.exe dist/KimiUI/
+          cp -R web-dist dist/KimiUI/web
+          cd dist && 7z a ../kimi-ui-windows-x64.zip KimiUI
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: kimi-ui-windows-x64.zip

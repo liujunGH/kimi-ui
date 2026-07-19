@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.8 (2026-07-19)
+
+- **Windows 支持（experimental）**：CI 新增 `windows-latest` 构建，产出 `kimi-ui-windows-x64.zip`（exe + Resources）；`find_kimi()` 补 Windows `.exe` 与安装路径。macOS 流程不变
+
 ## 0.1.7 (2026-07-19)
 
 - **窗口化阶段 1**（fork web）：turn 容器加 `content-visibility: auto`，离屏消息跳过布局/绘制——长会话布局成本与历史长度解耦，实测重启后 ~315MB
