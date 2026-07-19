@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout the kimi-code fork (web bundle source)
+        uses: actions/checkout@v4
+        with:
+          repository: liujunGH/kimi-code
+          ref: kimi-ui
+          path: kimi-code
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build the customized web bundle (web-dist/)
+        env:
+          KIMI_CODE_FORK: ${{ github.workspace }}/kimi-code
+        run: bash scripts/build-web.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and package Kimi Code.app
+        run: bash packaging/make-app.sh
+
+      - name: Zip the app bundle
+        run: ditto -c -k --sequesterRsrc --keepParent "Kimi Code.app" kimi-ui-macos-arm64.zip
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: kimi-ui-macos-arm64.zip

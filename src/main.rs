@@ -549,9 +549,97 @@ fn layout_strip(app: &tauri::AppHandle) {
     let _ = status_wv.set_size(LogicalSize::new(w, status_h));
 }
 
+// ---------------------------------------------------------------------------
+// Update check: compares the latest GitHub release tag with CARGO_PKG_VERSION.
+// Uses the gh CLI (carries the user's GitHub auth — the repo is private) and
+// falls back to the anonymous API once the repo is public.
+// ---------------------------------------------------------------------------
+
+/// Latest-release info exposed to the status page.
+#[derive(Clone, serde::Serialize)]
+struct UpdateInfo {
+    latest: String,
+    url: String,
+    has_update: bool,
+}
+
+static UPDATE_INFO: Mutex<Option<UpdateInfo>> = Mutex::new(None);
+
+/// Locate an executable: PATH first, then Homebrew spots (Finder/launchd
+/// environments get a minimal PATH).
+fn find_executable(name: &str) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    [
+        PathBuf::from(format!("/opt/homebrew/bin/{name}")),
+        PathBuf::from(format!("/usr/local/bin/{name}")),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+fn version_newer(latest: &str, current: &str) -> bool {
+    fn parts(v: &str) -> Vec<u32> {
+        v.split('.').filter_map(|p| p.parse().ok()).collect()
+    }
+    parts(latest) > parts(current)
+}
+
+fn fetch_latest_release() -> Option<UpdateInfo> {
+    let gh = find_executable("gh")?;
+    let out = Command::new(gh)
+        .args([
+            "api",
+            "repos/liujunGH/kimi-ui/releases/latest",
+            "--jq",
+            ".tag_name + \" \" + .html_url",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+    let (tag, url) = out.split_once(' ')?;
+    let latest = tag.trim_start_matches('v').to_string();
+    Some(UpdateInfo {
+        has_update: version_newer(&latest, env!("CARGO_PKG_VERSION")),
+        latest,
+        url: url.to_string(),
+    })
+}
+
+fn start_update_check() {
+    thread::spawn(|| {
+        let info = fetch_latest_release();
+        if let Ok(mut guard) = UPDATE_INFO.lock() {
+            *guard = info;
+        }
+    });
+}
+
+#[tauri::command]
+fn update_info() -> Value {
+    let info = UPDATE_INFO.lock().ok().and_then(|g| g.clone());
+    info.map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null)
+}
+
+#[tauri::command]
+fn open_url(url: String) {
+    if let Ok(u) = url.parse::<Url>() {
+        open_in_system_browser(&u);
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(SharedDaemon::new(None))
         .invoke_handler(tauri::generate_handler![
             notify,
@@ -561,7 +649,9 @@ fn main() {
             set_overlay,
             plan_usage,
             set_scroll_freeze,
-            toggle_devtools
+            toggle_devtools,
+            update_info,
+            open_url
         ])
         .setup(|app| {
             let window_builder = WindowBuilder::new(app, "main")
@@ -626,6 +716,7 @@ fn main() {
                     let _ = main_wv.eval(&format!("window.__kimiBootError({msg})"));
                 }
             });
+            start_update_check();
             Ok(())
         })
         .run(tauri::generate_context!())

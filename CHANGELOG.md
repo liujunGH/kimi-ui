@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6 (2026-07-19)
+
+- **CI 自动发版**：`.github/workflows/release.yml`——打 `v*` tag 即在 GitHub Actions 构建 web 包 + 打包 .app 并上传 Release（macOS arm64 zip），别人下载即用，无需拉两个仓库编译
+- **应用内更新提示**：启动时经 gh CLI 检查最新 Release，状态栏出现"⬆ 新版本"徽标，点击打开下载页
+- **窗口状态记忆**：`tauri-plugin-window-state`——窗口大小/位置/最大化重启还原
+- **构建脚本可移植性**：`build-web.sh` 不再依赖本机 nvm 路径（CI/其他机器可直接跑）
+- **fork web 历史上限**：已加载消息封顶 600 条，超出停止向上翻页（保留在线尾部），长会话内存增长封死
+
 ## 0.1.5 (2026-07-18)
 
 - **壳托管定制 UI（架构升级）**：壳内置零依赖静态服务（`127.0.0.1:58628`），托管 fork 构建的 kimi-web；daemon 地址与 token 经 URL hash 交接（与官方流程同构），官方 daemon 原样使用、官方通道升级。web-dist 缺失时自动回退 daemon 内嵌 UI

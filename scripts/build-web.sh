@@ -13,8 +13,15 @@ if [ ! -d "$FORK/apps/kimi-web" ]; then
   exit 1
 fi
 
-# pnpm via corepack (honors the repo's packageManager pin).
-export PATH="$HOME/.nvm/versions/node/v24.18.0/bin:$PATH"
+# pnpm via corepack (honors the repo's packageManager pin). Prefer the
+# known-good local Node when present, otherwise use whatever is on PATH.
+if [ -d "$HOME/.nvm/versions/node/v24.18.0/bin" ]; then
+  export PATH="$HOME/.nvm/versions/node/v24.18.0/bin:$PATH"
+fi
+if ! command -v corepack >/dev/null 2>&1; then
+  echo "error: corepack not found — install Node.js >= 22 first" >&2
+  exit 1
+fi
 
 corepack pnpm -C "$FORK" install --prefer-offline
 corepack pnpm -C "$FORK/apps/kimi-web" run build
