@@ -39,4 +39,13 @@ iconutil -c icns "$ICONSET" -o "$APP_NAME/Contents/Resources/icon.icns"
 
 codesign --force --deep --sign - "$APP_NAME"
 
+# Install: replace the installed app wholesale. A plain `cp -R` MERGES into
+# the existing bundle, which accumulated hundreds of stale web assets across
+# deployments (the app had silently grown to 79MB).
+if [ "${1:-}" = "--install" ]; then
+  rm -rf "/Applications/$APP_NAME"
+  cp -R "$APP_NAME" /Applications/
+  echo "✓ installed to /Applications/$APP_NAME"
+fi
+
 echo "✓ built $APP_NAME"
