@@ -36,7 +36,7 @@ jobs:
         run: bash packaging/make-app.sh
 
       - name: Zip the app bundle
-        run: ditto -c -k --sequesterRsrc --keepParent "Kimi Code.app" kimi-ui-macos-arm64.zip
+        run: cd build && ditto -c -k --sequesterRsrc --keepParent "Kimi Code.app" ../kimi-ui-macos-arm64.zip
 
       - name: Extract release notes from CHANGELOG.md
         shell: bash
