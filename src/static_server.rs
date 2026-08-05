@@ -1,8 +1,8 @@
-//! Minimal loopback static file server for the customized kimi-web bundle.
+//! Minimal loopback static file server for the official Kimi Code web bundle.
 //!
-//! The shell builds the SPA from the fork (see scripts/build-web.sh) and
+//! The shell stages the official prebuilt SPA (see scripts/build-web.sh) and
 //! serves it from 127.0.0.1 so the URL-hash credential handoff works exactly
-//! like the official daemon-hosted flow (`/#token=...&daemon_base=...`).
+//! like the official daemon-hosted flow (`/#token=...&kimi_origin=...`).
 //! No dependencies — std::net only. GET only, per-connection threads, SPA
 //! fallback to index.html for client-side routes, path-traversal guarded.
 //!

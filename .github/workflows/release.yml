@@ -14,20 +14,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout the kimi-code fork (web bundle source)
+      - name: Checkout the official Kimi Code web bundle
         uses: actions/checkout@v4
         with:
-          repository: liujunGH/kimi-code
-          ref: kimi-ui
+          repository: MoonshotAI/kimi-code
+          ref: '@moonshot-ai/kimi-code@0.33.0'
           path: kimi-code
+          sparse-checkout: apps/kimi-code/dist-web
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: Build the customized web bundle (web-dist/)
+      - name: Stage the official web bundle (web-dist/)
         env:
-          KIMI_CODE_FORK: ${{ github.workspace }}/kimi-code
+          KIMI_CODE_REPO: ${{ github.workspace }}/kimi-code
         run: bash scripts/build-web.sh
 
       - uses: dtolnay/rust-toolchain@stable
@@ -55,20 +52,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout the kimi-code fork (web bundle source)
+      - name: Checkout the official Kimi Code web bundle
         uses: actions/checkout@v4
         with:
-          repository: liujunGH/kimi-code
-          ref: kimi-ui
+          repository: MoonshotAI/kimi-code
+          ref: '@moonshot-ai/kimi-code@0.33.0'
           path: kimi-code
+          sparse-checkout: apps/kimi-code/dist-web
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: Build the customized web bundle (web-dist/)
+      - name: Stage the official web bundle (web-dist/)
         env:
-          KIMI_CODE_FORK: ${{ github.workspace }}/kimi-code
+          KIMI_CODE_REPO: ${{ github.workspace }}/kimi-code
         run: bash scripts/build-web.sh
 
       - uses: dtolnay/rust-toolchain@stable

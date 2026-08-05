@@ -4,6 +4,16 @@
 打 `v*` tag 发版时，CI 自动截取对应段落作为 GitHub Release 的 notes；
 应用内"更新提示"卡片展示的也是这里的内容。版本说明一律使用中文。
 
+## 0.1.13 - 2026-08-05
+
+- Web UI 改为直接使用 Kimi Code 0.33.0 release 中的官方预构建 bundle，不再维护或构建 `apps/kimi-web` fork
+- 构建与 CI 移除 Node/pnpm 前端编译步骤，固定同步官方 `apps/kimi-code/dist-web`，发布产物可复现
+- daemon 地址交接改用官方 bundle 原生支持的 `kimi_origin`，继续保留 URL hash 凭据交接与桌面模式
+- 修复已有 Kimi 服务占用默认端口时首次启动误连旧实例：壳显式选择空闲端口，并只等待自己拉起的服务
+- 壳内 Web UI 改用独立稳定端口 51821，避免与官方 daemon 的 58627+ 端口冲突，并让语言、主题和 onboarding 状态可跨重启保留
+- 最低 Kimi Code CLI 版本提升至 0.33.0，旧版本启动时会引导执行 `kimi upgrade`
+- 修正 macOS App 的版本元数据，确保 Finder 与系统信息显示 0.1.13
+
 ## 0.1.12 - 2026-07-19
 
 - 修复 release 白屏：嵌入资源收集改为递归（`include_dir` 的 `Dir::files()` 不含子目录，嵌套 JS/CSS 全部 404）；新增"index.html 引用资源必须可执行"回归测试拦截同类问题

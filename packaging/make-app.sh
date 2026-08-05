@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 APP_NAME="Kimi Code.app"
 STAGE="build/$APP_NAME"
 
-# Customized kimi-web bundle (from the fork), staged by scripts/build-web.sh.
+# Official Kimi Code web bundle, staged by scripts/build-web.sh.
 if [ ! -d web-dist ]; then
   echo "error: web-dist/ missing — run scripts/build-web.sh first" >&2
   exit 1

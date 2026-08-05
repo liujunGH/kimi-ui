@@ -8,17 +8,16 @@
 //! Launch flow:
 //!   1. open a window with a tiny local placeholder page immediately;
 //!   2. on a background thread, attach to an already-running server if one
-//!      exists; otherwise ensure one — legacy `kimi server run` on older
-//!      CLIs, or a spawned `kimi web --no-open` child (killed on app exit)
-//!      on newer ones. Discover the address from `server/instances/*.json`
-//!      first, falling back to the legacy `server/lock`, and read the bearer
-//!      token from `server.token` under $KIMI_CODE_HOME (default
-//!      ~/.kimi-code). kimi is version-gated (≥ 0.26); missing or outdated
-//!      installs get a guided error page;
-//!   3. navigate the main webview to the customized UI on the loopback
-//!      static server (127.0.0.1:58628) — the fork-built web bundle,
+//!      exists; otherwise spawn `kimi web --no-open` and kill that child on
+//!      app exit. Discover the address from `server/instances/*.json` first,
+//!      falling back to the legacy `server/lock`, and read the bearer token
+//!      from `server.token` under $KIMI_CODE_HOME (default ~/.kimi-code).
+//!      kimi is version-gated (≥ 0.33); missing or outdated installs get a
+//!      guided error page;
+//!   3. navigate the main webview to the official UI on the loopback static
+//!      server (127.0.0.1:51821) — the official prebuilt web bundle,
 //!      embedded into the exe in release builds and served from disk in
-//!      dev — with token and daemon origin handed over via the URL hash.
+//!      dev — with token and daemon origin handed over via the URL.
 //!
 //! Window layout (nothing shifts the SPA):
 //!   - a bare window holds two child webviews;
@@ -53,7 +52,7 @@
 
 use std::{
     fs,
-    net::{TcpStream, ToSocketAddrs},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -73,6 +72,9 @@ mod static_server;
 /// Status strip height (collapsed) and overlay height (card open).
 const STRIP: f64 = 28.0;
 const OVERLAY_H: f64 = 340.0;
+/// Stable, shell-owned origin so Web Storage survives app restarts. Keep this
+/// outside Kimi's 58627+ daemon port range.
+const CUSTOM_UI_PORT: u16 = 51821;
 
 /// Unread-notification count shown on the Dock icon (macOS).
 static BADGE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -312,9 +314,8 @@ fn no_console(cmd: Command) -> Command {
     cmd
 }
 
-/// Oldest kimi CLI the shell can drive: older builds lack the server
-/// commands (`kimi server run` / `kimi web`) the launch flow needs.
-const MIN_KIMI_VERSION: &str = "0.26.0";
+/// Oldest kimi CLI paired with the official web bundle shipped by this build.
+const MIN_KIMI_VERSION: &str = "0.33.0";
 
 /// Structured boot failure; the placeholder page renders it as guided steps.
 #[derive(Clone, serde::Serialize)]
@@ -339,10 +340,7 @@ static SPAWNED_SERVER: Mutex<Option<Child>> = Mutex::new(None);
 ///
 ///   1. attach to an already-running server (the user's own `kimi web`, or a
 ///      daemon from an older CLI) — no subprocess at all;
-///   2. legacy `kimi server run` (≤ 0.27) spawns/reuses a background daemon;
-///      newer CLIs print a deprecation notice and exit 1, which just falls
-///      through;
-///   3. spawn `kimi web --no-open` ourselves and wait (≤15s, bailing early
+///   2. spawn `kimi web --no-open` ourselves and wait (≤15s, bailing early
 ///      if the child dies) for it to register under `server/instances/`.
 fn connect_daemon() -> Result<Launch, BootError> {
     let kimi = find_kimi().ok_or(BootError::KimiMissing)?;
@@ -361,22 +359,17 @@ fn connect_daemon() -> Result<Launch, BootError> {
         return Ok(launch);
     }
 
-    let legacy_ok = no_console(Command::new(&kimi))
-        .args(["server", "run"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if legacy_ok {
-        if let Ok(launch) = attach_with_retry(&home, 4, Duration::from_millis(300)) {
-            return Ok(launch);
-        }
-    }
-
-    let mut child = spawn_web_server(&kimi).map_err(|e| BootError::DaemonUnreachable {
+    let (mut child, port) = spawn_web_server(&kimi).map_err(|e| BootError::DaemonUnreachable {
         detail: format!("拉起 `kimi web --no-open` 失败：{e}"),
         version: version.clone(),
     })?;
-    match wait_attach(&home, &mut child, 50, Duration::from_millis(300)) {
+    match wait_attach(
+        &home,
+        &mut child,
+        port,
+        50,
+        Duration::from_millis(300),
+    ) {
         Ok(launch) => {
             if let Ok(mut guard) = SPAWNED_SERVER.lock() {
                 *guard = Some(child);
@@ -397,15 +390,16 @@ fn connect_daemon() -> Result<Launch, BootError> {
 /// Attach to a reachable daemon (single attempt) and build the launch params.
 fn attach(home: &Path) -> Result<Launch, String> {
     let addr = discover_daemon(home)?;
+    launch_at(home, addr)
+}
+
+/// Build launch details for a specific reachable server.
+fn launch_at(home: &Path, addr: DaemonAddr) -> Result<Launch, String> {
     let token = fs::read_to_string(home.join("server.token"))
         .map_err(|e| format!("读取 server.token 失败：{e}"))?;
     let token = token.trim().to_string();
 
-    let desktop_query = if cfg!(target_os = "macos") {
-        "?kimi_desktop&platform=darwin"
-    } else {
-        ""
-    };
+    let desktop_query = desktop_query();
     let base = format!("http://{}:{}", addr.host, addr.port);
     let url = format!("{base}/{desktop_query}#token={token}")
         .parse()
@@ -413,22 +407,16 @@ fn attach(home: &Path) -> Result<Launch, String> {
     Ok(Launch { base, token, url })
 }
 
-/// `attach()` with retries — a freshly spawned server needs a moment before
-/// its registry file and port are live.
-fn attach_with_retry(home: &Path, attempts: u32, interval: Duration) -> Result<Launch, String> {
-    let mut last_err = String::new();
-    for attempt in 0..attempts {
-        match attach(home) {
-            Ok(launch) => return Ok(launch),
-            Err(e) => {
-                last_err = e;
-                if attempt + 1 < attempts {
-                    thread::sleep(interval);
-                }
-            }
-        }
+/// Official bundle flags for desktop-only behavior. Keep the platform values
+/// aligned with Node's `process.platform`, which the web bundle also uses.
+fn desktop_query() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "?kimi_desktop&platform=darwin"
+    } else if cfg!(target_os = "windows") {
+        "?kimi_desktop&platform=win32"
+    } else {
+        "?kimi_desktop&platform=linux"
     }
-    Err(last_err)
 }
 
 /// Poll `attach` until the spawned server registers (bounded by
@@ -437,14 +425,26 @@ fn attach_with_retry(home: &Path, attempts: u32, interval: Duration) -> Result<L
 fn wait_attach(
     home: &Path,
     child: &mut Child,
+    port: u16,
     attempts: u32,
     interval: Duration,
 ) -> Result<Launch, String> {
     let mut last_err = String::new();
     for attempt in 0..attempts {
-        match attach(home) {
-            Ok(launch) => return Ok(launch),
-            Err(e) => last_err = e,
+        let host = "127.0.0.1";
+        if tcp_alive(host, port) {
+            match launch_at(
+                home,
+                DaemonAddr {
+                    host: host.to_string(),
+                    port,
+                },
+            ) {
+                Ok(launch) => return Ok(launch),
+                Err(e) => last_err = e,
+            }
+        } else {
+            last_err = format!("等待 {host}:{port} 接受连接");
         }
         if let Ok(Some(status)) = child.try_wait() {
             let log = fs::read_to_string(web_stderr_log()).unwrap_or_default();
@@ -466,18 +466,24 @@ fn web_stderr_log() -> PathBuf {
     std::env::temp_dir().join("kimi-ui-web-server.log")
 }
 
-/// Spawn `kimi web --no-open` as a background child (new-style CLIs have no
-/// daemon manager; the foreground server stays up while the child lives).
-/// stderr goes to a temp log so `wait_attach` can report why a boot failed.
-fn spawn_web_server(kimi: &Path) -> Result<Child, String> {
+/// Spawn `kimi web --no-open` on an explicitly selected free port. Selecting
+/// the port here keeps the shell attached to its own child when the default
+/// 58627 is already occupied by another Kimi instance.
+fn spawn_web_server(kimi: &Path) -> Result<(Child, u16), String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    drop(listener);
+
     let log = fs::File::create(web_stderr_log()).map_err(|e| e.to_string())?;
-    no_console(Command::new(kimi))
-        .args(["web", "--no-open"])
+    let port_arg = port.to_string();
+    let child = no_console(Command::new(kimi))
+        .args(["web", "--port", port_arg.as_str(), "--no-open"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok((child, port))
 }
 
 /// `kimi --version` → e.g. "0.27.0". Best-effort: None when unparseable.
@@ -577,7 +583,7 @@ fn discover_daemon(home: &Path) -> Result<DaemonAddr, String> {
     Err("没有发现可达的 kimi daemon（server/instances 与 server/lock 均无效）".to_string())
 }
 
-/// Dev-only: the customized kimi-web bundle (fork build) on disk —
+/// Dev-only: the official Kimi Code web bundle on disk —
 /// `web/` next to the exe, `<exe>/../Resources/web`, or `<project>/web-dist`.
 /// Release builds embed the bundle into the exe instead (see asset_source()).
 #[cfg(debug_assertions)]
@@ -618,7 +624,7 @@ fn collect_embedded(dir: &'static include_dir::Dir<'static>, out: &mut Vec<(Stri
     }
 }
 
-/// Asset source for the customized UI: embedded into the exe in release.
+/// Asset source for the official UI: embedded into the exe in release.
 #[cfg(not(debug_assertions))]
 fn asset_source() -> Option<static_server::AssetSource> {
     let mut files = Vec::new();
@@ -626,25 +632,21 @@ fn asset_source() -> Option<static_server::AssetSource> {
     Some(static_server::AssetSource::from_memory(files))
 }
 
-/// Asset source for the customized UI: dev builds serve web-dist/ from disk,
+/// Asset source for the official UI: dev builds serve web-dist/ from disk,
 /// so web rebuilds don't need a cargo rebuild.
 #[cfg(debug_assertions)]
 fn asset_source() -> Option<static_server::AssetSource> {
     web_root().map(static_server::AssetSource::Dir)
 }
 
-/// URL of the customized UI served by our loopback static server, with the
-/// token and live daemon origin handed over via the URL hash (same handoff
-/// shape the official daemon-hosted flow uses).
+/// URL of the official UI served by our loopback static server, with the token
+/// in the hash and the live daemon origin in `kimi_origin`. The latter is the
+/// desktop handoff supported by the official bundle.
 fn custom_ui_url(base: &str, token: &str) -> Option<Url> {
-    let port = static_server::serve(asset_source()?, 58628).ok()?;
+    let port = static_server::serve(asset_source()?, CUSTOM_UI_PORT).ok()?;
     let enc_base = base.replace(':', "%3A").replace('/', "%2F");
-    let desktop_query = if cfg!(target_os = "macos") {
-        "?kimi_desktop&platform=darwin"
-    } else {
-        ""
-    };
-    format!("http://127.0.0.1:{port}/{desktop_query}&daemon_base={enc_base}#token={token}")
+    let desktop_query = desktop_query();
+    format!("http://127.0.0.1:{port}/{desktop_query}&kimi_origin={enc_base}#token={token}")
         .parse()
         .ok()
 }
@@ -1459,10 +1461,18 @@ mod tests {
 
     #[test]
     fn enforces_minimum_kimi_version() {
-        assert!(version_older("0.25.9", MIN_KIMI_VERSION));
-        assert!(!version_older("0.26.0", MIN_KIMI_VERSION));
-        assert!(!version_older("0.26.1", MIN_KIMI_VERSION));
-        assert!(!version_older("0.27.0", MIN_KIMI_VERSION));
+        assert!(version_older("0.32.9", MIN_KIMI_VERSION));
+        assert!(!version_older("0.33.0", MIN_KIMI_VERSION));
+        assert!(!version_older("0.33.1", MIN_KIMI_VERSION));
         assert!(!version_older("1.0.0", MIN_KIMI_VERSION));
+    }
+
+    #[test]
+    fn desktop_query_uses_official_bundle_flags() {
+        let query = desktop_query();
+        assert!(query.starts_with("?kimi_desktop&platform="));
+        if cfg!(target_os = "macos") {
+            assert_eq!(query, "?kimi_desktop&platform=darwin");
+        }
     }
 }

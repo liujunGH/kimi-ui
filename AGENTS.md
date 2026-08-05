@@ -2,11 +2,11 @@
 
 Kimi Code 官方 web UI 的桌面壳：Tauri 2 + 系统 WebView（macOS WKWebView），单可执行文件分发，不是官方产品的 fork。
 
-## 双仓架构
+## 上游产物架构
 
 - 本仓 `liujunGH/kimi-ui`：壳（Rust/Tauri）。
-- 兄弟仓 `liujunGH/kimi-code`（分支 `kimi-ui`）：定制 kimi-web 的源码，只改 `apps/kimi-web`；`scripts/build-web.sh` 用它构建出 `web-dist/`（需要 `KIMI_CODE_FORK` 指向 fork 本地路径，Node ≥ 24.15 + corepack pnpm）。
-- fork 上的通用修复会回提上游 MoonshotAI/kimi-code；壳专用改动（daemon 地址交接、相对资源路径）只留 fork，不提上游。
+- 上游 `MoonshotAI/kimi-code`：官方 daemon/API 及已提交的预构建 Web 产物 `apps/kimi-code/dist-web`；本项目固定官方 release tag，`scripts/build-web.sh` 仅将该目录原子同步为 `web-dist/`（用 `KIMI_CODE_REPO` 指向本地 checkout）。
+- 不再维护 `apps/kimi-web` fork。Web UI 源码已由上游迁出 kimi-code 仓；界面问题提交上游，本仓只维护桌面壳集成、原生能力和打包。
 
 ## 构建与测试
 
@@ -16,7 +16,7 @@ Kimi Code 官方 web UI 的桌面壳：Tauri 2 + 系统 WebView（macOS WKWebVie
 
 ## 版本与发版
 
-- 版本号保持 `0.1.x`，不动大版本；bump 时 `Cargo.toml` 与 `tauri.conf.json` 同步改，`cargo check` 刷新 `Cargo.lock`。
+- 版本号保持 `0.1.x`，不动大版本；bump 时 `Cargo.toml`、`tauri.conf.json` 与 `packaging/Info.plist` 同步改（plist 的 `CFBundleVersion` 单调递增），`cargo check` 刷新 `Cargo.lock`。
 - 发版流程：提交 → 推 main → 打 `v*` tag → CI 双平台构建并上传 Release。
 - **版本说明一律中文，唯一来源是 `CHANGELOG.md`**（标题格式 `## 版本号 - 日期`）。CI 发版时自动截取对应段落写入 Release，不要在 GitHub 上手写，也不要依赖自动生成的英文提交列表。
 - 提交信息：英文、conventional 风格（`feat:` / `fix:` / `ci:` / `docs:`），发版提交形如 `0.1.x: 摘要`。
