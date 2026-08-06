@@ -22,6 +22,7 @@ fi
 # must never embed a half-copied bundle (that white-screens the app).
 rm -rf web-dist.tmp
 cp -R "$SOURCE" web-dist.tmp
+bash scripts/check-web-performance.sh web-dist.tmp
 rm -rf web-dist
 mv web-dist.tmp web-dist
 echo "✓ web-dist/ updated from official bundle at $SOURCE"

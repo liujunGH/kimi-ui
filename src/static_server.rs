@@ -3,13 +3,15 @@
 //! The shell stages the official prebuilt SPA (see scripts/build-web.sh) and
 //! serves it from 127.0.0.1 so the URL-hash credential handoff works exactly
 //! like the official daemon-hosted flow (`/#token=...&kimi_origin=...`).
-//! No dependencies — std::net only. GET only, per-connection threads, SPA
+//! No dependencies — std::net only. GET/HEAD, per-connection threads, SPA
 //! fallback to index.html for client-side routes, path-traversal guarded.
 //!
 //! Assets come from an `AssetSource`: a directory on disk (dev builds) or an
 //! in-memory map (release builds embed web-dist/ into the exe for
 //! single-file distribution).
 
+#[cfg(not(debug_assertions))]
+use std::collections::HashMap;
 use std::{
     borrow::Cow,
     io::{Read, Write},
@@ -20,8 +22,6 @@ use std::{
 };
 #[cfg(debug_assertions)]
 use std::{fs, path::PathBuf};
-#[cfg(not(debug_assertions))]
-use std::collections::HashMap;
 
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
@@ -38,6 +38,17 @@ fn content_type(path: &Path) -> &'static str {
         Some("ttf") => "font/ttf",
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
+    }
+}
+
+/// Vite emits content-hashed files below assets/. They can be reused across
+/// launches indefinitely; index.html and other stable names must revalidate so
+/// an upstream bundle update immediately picks up its new hashed entrypoints.
+fn cache_control(url_path: &str) -> &'static str {
+    if url_path.trim_start_matches('/').starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
     }
 }
 
@@ -72,11 +83,18 @@ impl AssetSource {
     }
 
     /// Fetch an asset by URL path; SPA client-side routes fall back to
-    /// index.html. `None` only when even index.html is absent.
+    /// index.html. Missing paths below assets/ return `None` directly.
     fn lookup(&self, url_path: &str) -> Option<(Cow<'_, [u8]>, &'static str)> {
         match self {
             #[cfg(debug_assertions)]
             AssetSource::Dir(root) => {
+                let clean = url_path.trim_start_matches('/');
+                // Missing asset URLs are real 404s, not SPA routes. Besides
+                // being semantically correct, this prevents caching an
+                // index.html fallback under an immutable asset URL.
+                if clean.starts_with("assets/") && !root.join(clean).is_file() {
+                    return None;
+                }
                 let file = resolve(root, url_path);
                 fs::read(&file)
                     .ok()
@@ -85,7 +103,16 @@ impl AssetSource {
             #[cfg(not(debug_assertions))]
             AssetSource::Memory(map) => {
                 let clean = url_path.trim_start_matches('/');
-                let clean = if clean.is_empty() { "index.html" } else { clean };
+                let clean = if clean.is_empty() {
+                    "index.html"
+                } else {
+                    clean
+                };
+                if clean.starts_with("assets/") {
+                    return map
+                        .get(clean)
+                        .map(|(body, mime)| (Cow::Borrowed(*body), *mime));
+                }
                 map.get(clean)
                     .or_else(|| map.get(&format!("{clean}/index.html")))
                     .or_else(|| map.get("index.html"))
@@ -113,7 +140,9 @@ fn handle(mut stream: TcpStream, source: &AssetSource) {
     let mut buf = [0u8; 8192];
     let Ok(n) = stream.read(&mut buf) else { return };
     let request = String::from_utf8_lossy(&buf[..n]);
-    let Some(line) = request.lines().next() else { return };
+    let Some(line) = request.lines().next() else {
+        return;
+    };
     let mut parts = line.split_whitespace();
     let (Some(method), Some(target), _) = (parts.next(), parts.next(), parts.next()) else {
         return;
@@ -146,8 +175,9 @@ fn handle(mut stream: TcpStream, source: &AssetSource) {
 
     match source.lookup(&normalized) {
         Some((body, mime)) => {
+            let cache = cache_control(&normalized);
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             let _ = stream.write_all(head.as_bytes());
@@ -177,4 +207,29 @@ pub fn serve(source: AssetSource, preferred_port: u16) -> std::io::Result<u16> {
         }
     });
     Ok(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_control;
+
+    #[test]
+    fn hashed_asset_urls_are_immutable() {
+        assert_eq!(
+            cache_control("/assets/index-B-HzRssS.js"),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn stable_entrypoints_must_revalidate() {
+        assert_eq!(cache_control("/"), "no-cache");
+        assert_eq!(cache_control("/index.html"), "no-cache");
+        assert_eq!(cache_control("/boot.js"), "no-cache");
+    }
+
+    #[test]
+    fn spa_routes_must_revalidate() {
+        assert_eq!(cache_control("/sessions/example"), "no-cache");
+    }
 }

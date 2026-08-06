@@ -129,48 +129,70 @@ const INIT_SCRIPT: &str = r#"
   var isDesktop = new URLSearchParams(location.search).has('kimi_desktop')
     || (function () { try { return sessionStorage.getItem('kimi-desktop') === '1'; } catch (e) { return false; } })();
 
-  // 3. Drag-region mirroring, badge hiding, thinking cap, list fix.
-  function patchDom() {
-    var els = document.querySelectorAll('.side.macos-desktop .ch, .chat-header.macos-desktop');
+  // 3. Static shell fixes live in one stylesheet. This avoids repeatedly
+  // walking the entire chat DOM while the official UI is streaming.
+  var shellStyleId = 'kimi-desktop-shell-style';
+  function ensureShellStyle() {
+    if (document.getElementById(shellStyleId)) return;
+    var root = document.head || document.documentElement;
+    if (!root) return;
+    var style = document.createElement('style');
+    style.id = shellStyleId;
+    style.textContent = [
+      '.internal-build-tag{display:none!important}',
+      '.tc-wrap:not(.is-collapsed) pre.tc{max-height:9em!important;overflow-y:auto!important}',
+      '.md ol{padding-left:2.2em!important}',
+      '.u-turn{content-visibility:auto;contain-intrinsic-block-size:auto 96px}',
+      '.a-msg{content-visibility:auto;contain-intrinsic-block-size:auto 480px}'
+    ].join('');
+    root.appendChild(style);
+  }
+
+  // Drag-region attributes cannot be expressed in CSS. Patch only newly
+  // inserted subtrees instead of running a full-document query on every
+  // MutationObserver batch.
+  var dragSelector = '.side.macos-desktop .ch, .chat-header.macos-desktop';
+  function patchDragScope(root) {
+    if (!root || (root.nodeType !== 1 && root.nodeType !== 9)) return;
+    if (root.matches && root.matches(dragSelector)) {
+      root.setAttribute('data-tauri-drag-region', 'deep');
+    }
+    var els = root.querySelectorAll ? root.querySelectorAll(dragSelector) : [];
     for (var i = 0; i < els.length; i++) {
       if (els[i].getAttribute('data-tauri-drag-region') !== 'deep') {
         els[i].setAttribute('data-tauri-drag-region', 'deep');
       }
     }
-    var pills = document.querySelectorAll('.internal-build-tag');
-    for (var j = 0; j < pills.length; j++) {
-      pills[j].style.display = 'none';
-    }
-    var streaming = document.querySelectorAll('.tc-wrap:not(.is-collapsed) pre.tc');
-    for (var k = 0; k < streaming.length; k++) {
-      streaming[k].style.maxHeight = '9em';
-      streaming[k].style.overflowY = 'auto';
-    }
-    var collapsed = document.querySelectorAll('.tc-wrap.is-collapsed pre.tc');
-    for (var m = 0; m < collapsed.length; m++) {
-      collapsed[m].style.maxHeight = '';
-      collapsed[m].style.overflowY = '';
-    }
-    var ols = document.querySelectorAll('.md ol');
-    for (var n = 0; n < ols.length; n++) {
-      if (ols[n].style.paddingLeft !== '2.2em') ols[n].style.paddingLeft = '2.2em';
-    }
   }
-  // The observer only marks dirty and a 150ms coalesced run does the work:
-  // the SPA's virtualized list mutates the DOM continuously while scrolling
-  // and streaming, and running five full-document querySelectorAll per
-  // mutation was the main jank source.
+
+  var pendingRoots = [];
   var patchScheduled = false;
+  function queuePatch(root) {
+    if (!root || root.nodeType !== 1) return;
+    if (pendingRoots.indexOf(root) === -1) pendingRoots.push(root);
+    schedulePatch();
+  }
   function schedulePatch() {
     if (patchScheduled) return;
     patchScheduled = true;
-    setTimeout(function () {
+    requestAnimationFrame(function () {
       patchScheduled = false;
-      patchDom();
-    }, 150);
+      ensureShellStyle();
+      var roots = pendingRoots.splice(0, pendingRoots.length);
+      for (var i = 0; i < roots.length; i++) patchDragScope(roots[i]);
+    });
   }
-  new MutationObserver(schedulePatch).observe(document.documentElement, { childList: true, subtree: true });
-  patchDom();
+  new MutationObserver(function (records) {
+    for (var i = 0; i < records.length; i++) {
+      for (var j = 0; j < records[i].addedNodes.length; j++) {
+        queuePatch(records[i].addedNodes[j]);
+      }
+    }
+    // The SPA can replace <head>; restore the shell stylesheet if needed.
+    if (!document.getElementById(shellStyleId)) schedulePatch();
+  }).observe(document.documentElement, { childList: true, subtree: true });
+  ensureShellStyle();
+  patchDragScope(document);
 
   // 4. Double-click on a drag region toggles maximize (zoom).
   document.addEventListener('dblclick', function (e) {
@@ -195,11 +217,11 @@ const INIT_SCRIPT: &str = r#"
         broken.push('窗口拖拽/桌面布局');
       }
       var pill = document.querySelector('.internal-build-tag');
-      if (pill && pill.style.display !== 'none' && pill.offsetParent !== null) {
+      if (pill && getComputedStyle(pill).display !== 'none' && pill.offsetParent !== null) {
         broken.push('角标隐藏');
       }
       var tc = document.querySelector('.tc-wrap:not(.is-collapsed) pre.tc');
-      if (tc && tc.style.maxHeight !== '9em') {
+      if (tc && !document.getElementById(shellStyleId)) {
         broken.push('思考限高');
       }
       if (broken.length) {
@@ -1409,6 +1431,10 @@ mod tests {
         let text = String::from_utf8_lossy(&response);
         assert!(text.starts_with("HTTP/1.1 200 OK"), "response: {text:.200}");
         assert!(text.contains("text/html"), "response: {text:.200}");
+        assert!(
+            text.contains("Cache-Control: no-cache"),
+            "stable entrypoints must revalidate: {text:.300}"
+        );
         assert!(text.to_lowercase().contains("<html"), "response: {text:.200}");
     }
 
@@ -1447,6 +1473,15 @@ mod tests {
         assert!(
             head.contains("text/javascript"),
             "{asset} must be executable JS, not the SPA fallback: {head:.200}"
+        );
+        assert!(
+            head.contains("Cache-Control: public, max-age=31536000, immutable"),
+            "hashed assets should be cached across launches: {head:.300}"
+        );
+        let missing = get("/assets/definitely-missing.js");
+        assert!(
+            missing.starts_with("HTTP/1.1 404 Not Found"),
+            "missing assets must not receive the SPA fallback: {missing:.200}"
         );
     }
 

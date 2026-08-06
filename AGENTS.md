@@ -7,10 +7,11 @@ Kimi Code 官方 web UI 的桌面壳：Tauri 2 + 系统 WebView（macOS WKWebVie
 - 本仓 `liujunGH/kimi-ui`：壳（Rust/Tauri）。
 - 上游 `MoonshotAI/kimi-code`：官方 daemon/API 及已提交的预构建 Web 产物 `apps/kimi-code/dist-web`；本项目固定官方 release tag，`scripts/build-web.sh` 仅将该目录原子同步为 `web-dist/`（用 `KIMI_CODE_REPO` 指向本地 checkout）。
 - 不再维护 `apps/kimi-web` fork。Web UI 源码已由上游迁出 kimi-code 仓；界面问题提交上游，本仓只维护桌面壳集成、原生能力和打包。
+- 不直接修改压缩后的 `dist-web`。长会话窗口化、工具输出分段、官方观察器和入口拆分等需求记录在 `docs/performance.md`，待官方 Web 源码可用后提交上游。
 
 ## 构建与测试
 
-- 提交前必须：`cargo build` 与 `cargo build --release` 均 0 警告，`cargo test` 与 `cargo test --release` 全过（release 下 web 资源走内嵌路径，两套覆盖不同代码路径）。
+- 提交前必须：`bash scripts/check-web-performance.sh` 通过；`cargo build` 与 `cargo build --release` 均 0 警告；`cargo test` 与 `cargo test --release` 全过（release 下 web 资源走内嵌路径，两套覆盖不同代码路径）。
 - 本地安装：`bash packaging/make-app.sh --install`（整体替换 /Applications，再手动重启验证）。
 - UI 类改动必须截图亲眼验证后才算完成；截图只截必要小区域、验证后即删，**绝不**把含会话内容的截图放进仓库。
 
@@ -25,11 +26,14 @@ Kimi Code 官方 web UI 的桌面壳：Tauri 2 + 系统 WebView（macOS WKWebVie
 ## 代码规范
 
 - `src/static_server.rs` 保持零依赖（std::net only）。
+- 静态服务只给 `assets/` 内容哈希资源长期 immutable 缓存；稳定入口和 SPA 路由必须保持 `no-cache`，文件命名与体积由性能脚本把关。
 - release 编译期内嵌 `web-dist/`（`include_dir`），debug 读磁盘；`build.rs` 已挂 `rerun-if-changed`。
 - Windows 兼容：release 走 GUI 子系统（无控制台黑窗）；拉起任何子进程必须经 `no_console()`（`CREATE_NO_WINDOW`）。
 - 启动/连接错误用结构化类型（`BootError`），由占位页按类型渲染操作指引。
 - 新增 `#[tauri::command]` 必须三处同步：`build.rs` 的 `AppManifest::commands` 列表、`capabilities/default.json`（远程源页面用到的命令）、`capabilities/local.json`（本地状态栏用到的命令）——远程源默认被 ACL 拒绝，漏授的症状是功能静默失效 + 控制台一条报错。
 - 改动窗口/webview 框架的原生操作（如开关 devtools）之后必须重跑 `layout_strip`，WKWebView 不会自己把框架缩回去。
+- 状态栏独立 WebView 是本地受信权限边界；没有完整 ACL、安全与内存收益证据，不合并进远程官方页面。
+- 主 WebView 的 DOM 观察器不得在流式更新时反复全页扫描；优先静态 CSS、只处理新增子树，并按 `docs/performance.md` 做真实长会话回归。
 - 前端一律 `textContent` 渲染外部内容（Release notes、daemon 数据），禁止 innerHTML 注入。
 - 代码注释用英文，用户可见文案用中文。
 

@@ -1,0 +1,67 @@
+# 性能基线与优化边界
+
+本文记录桌面壳和官方 Web bundle 的性能边界、当前基线、自动门禁与上游待办。数字是回归参考，不是对所有机器的承诺。
+
+## 当前结论
+
+2026-08-06 在 macOS 上使用 release 壳和 `@moonshot-ai/kimi-code@0.33.0` 官方 bundle 进行真实短会话验证：
+
+| 项目 | 结果 |
+| --- | --- |
+| 首次页面导航 | 约 277 ms，40 个资源，516 个 DOM 节点 |
+| 两次流式回复后 | 591 个 DOM 节点，6 个 turn 容器 |
+| 25 秒动画帧采样 | 1498 帧（约 60 FPS），最长间隔 55 ms |
+| bundle | 534 个文件，33,281,181 bytes；入口 JS 2,092,189 bytes，入口 CSS 464,734 bytes |
+| 完整应用空闲内存 | 约 340–360 MB（包含壳、WKWebView 与 WebKit 辅助进程） |
+| 流式阶段内存 | 平均约 372 MB，观测峰值约 491 MB，结束后会回落 |
+| 空闲 CPU | 约 0.4% |
+| 视口外长历史合成回归 | 240 个 turn 克隆、5,640 个节点：普通布局 31 ms，`content-visibility` 23 ms（降低 25.8%） |
+
+短会话交互正常。主要风险仍是长会话 DOM/布局成本、超长工具输出和官方入口资源继续增长。
+
+## 本仓已经落地的优化
+
+- `assets/` 下的内容哈希资源返回一年 `immutable` 缓存；`index.html`、`boot.js` 和 SPA 路由继续 `no-cache`，保证升级后立即引用新入口。
+- 缺失的 `/assets/*` 直接返回 404，不再把 `index.html` 作为资源响应缓存。
+- 桌面注入样式集中为一个 `<style>`；DOM 观察器只扫描新增子树的拖拽区域，不再在流式输出时反复全页查询五组选择器。
+- 用户 turn 与助手消息使用 `content-visibility: auto`，让 WebKit 跳过视口外长历史消息的布局和绘制；保留估算高度以降低滚动条跳动。
+- 同步官方 bundle 时自动执行 `scripts/check-web-performance.sh`，超过预算就不替换现有 `web-dist/`。
+
+状态栏继续保留为独立的本地受信 WebView。它使用单独 ACL，避免给远程官方页面开放额度、更新和 daemon 状态命令；实测空闲 CPU 很低，因此不为节省一个 WebView 破坏这条权限边界。
+
+## 自动资源预算
+
+```bash
+bash scripts/check-web-performance.sh
+```
+
+默认预算：
+
+| 指标 | 上限 |
+| --- | ---: |
+| 文件数 | 600 |
+| bundle 总大小 | 40 MiB |
+| 入口 JS | 2.5 MiB |
+| 入口 CSS | 600 KiB |
+| 单个资源 | 8 MiB |
+
+预算不是盲目压缩目标。升级官方 tag 时如果合理地超过预算，应先记录原因和真实体验数据，再用 `MAX_WEB_FILES`、`MAX_WEB_BYTES`、`MAX_ENTRY_JS_BYTES`、`MAX_ENTRY_CSS_BYTES` 或 `MAX_SINGLE_ASSET_BYTES` 显式调整门槛。
+
+## 每次升级的真实体验检查
+
+1. 运行 `KIMI_CODE_REPO=... bash scripts/build-web.sh`，确认资源预算通过。
+2. 用 release 壳启动一个真实会话，检查新建会话、流式输出、思考折叠、工具输出、历史滚动、搜索/复制和返回底部。
+3. 在 Web Inspector 确认 `#kimi-desktop-shell-style` 存在，`.u-turn` / `.a-msg` 的 `content-visibility` 为 `auto`，控制台没有 Tauri ACL 或脚本异常。
+4. 检查 `/` 为 `Cache-Control: no-cache`，入口 `/assets/*` 为 `public, max-age=31536000, immutable`，缺失资源为 404。
+5. 至少观察 30 秒流式输出和 60 秒结束后的内存；记录帧长间隔、峰值和是否回落。截图只保留必要小区域，验证后删除。
+
+## 官方 Web 上游待办
+
+官方仓库目前只提交 `apps/kimi-code/dist-web`，没有可维护的 Web 源码。本仓不修改压缩产物，也不恢复 Web fork。以下改动应在官方 Web 源码可用后提交上游：
+
+- **长会话窗口化**：只挂载视口附近的 turn，同时保证滚动锚点、浏览器搜索、复制、折叠/展开和跳转到 turn 正常；100 个复杂 turn 下滚动仍保持流畅，DOM 节点不随完整历史线性增长。
+- **工具输出分段**：默认只渲染摘要或首尾片段，用户可按需展开/下载全文；1 MB 输出不能阻塞主线程，也不能让单个 turn 产生上万个节点。
+- **缩小官方 MutationObserver 范围**：按实际需要监听 `childList`/文本变化，避免对整个聊天子树监听无关 attributes；流式 30 秒内回调和记录数应有可解释上限。
+- **入口拆分**：Mermaid、语法高亮语言包、Rive 和大字体按需加载；首屏不下载当前会话用不到的模块，入口 JS/CSS 保持在本仓预算内。
+
+这些上游项验收时必须使用真实长会话，而不能只靠合成 DOM 或短会话分数。
