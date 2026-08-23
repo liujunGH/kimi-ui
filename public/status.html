@@ -196,9 +196,19 @@
         });
       }
 
-      // ---- plan quota (scraped from the TUI's /usage by the Rust side) ----
+      // ---- plan quota (daemon REST /api/v1/oauth/usage; the Rust side
+      //      fetches and caches, we format the reset timestamps) ----
       var planUsage = null;
       var planLoadingRounds = 0;
+      function fmtReset(iso) {
+        var ms = Date.parse(iso);
+        if (!isFinite(ms)) return '';
+        var mins = Math.max(0, Math.round((ms - Date.now()) / 60000));
+        var d = Math.floor(mins / 1440), h = Math.floor((mins % 1440) / 60), m = mins % 60;
+        if (d > 0) return d + '天' + (h ? h + '小时' : '');
+        if (h > 0) return h + '小时' + (m ? m + '分' : '');
+        return m + '分';
+      }
       function pollPlanUsage() {
         invoke('plan_usage').then(function (d) {
           if (d && typeof d.weekly_pct === 'number') {
@@ -317,8 +327,8 @@
           ['状态', st.busy ? '运行中' : '空闲']
         ];
         if (planUsage) {
-          rows.push(['5 小时额度', planUsage.hourly_pct + '%（' + planUsage.hourly_reset + '后重置）']);
-          rows.push(['每周额度', planUsage.weekly_pct + '%（' + planUsage.weekly_reset + '后重置）']);
+          rows.push(['5 小时额度', planUsage.hourly_pct + '%' + (fmtReset(planUsage.hourly_reset_at) ? '（' + fmtReset(planUsage.hourly_reset_at) + '后重置）' : '')]);
+          rows.push(['每周额度', planUsage.weekly_pct + '%' + (fmtReset(planUsage.weekly_reset_at) ? '（' + fmtReset(planUsage.weekly_reset_at) + '后重置）' : '')]);
         }
         document.getElementById('usageCard').innerHTML = rows.map(function (r) {
           return '<div class="row"><span class="k">' + esc(r[0]) + '</span><span>' + esc(String(r[1])) + '</span></div>';

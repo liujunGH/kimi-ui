@@ -12,7 +12,7 @@
 //!      app exit. Discover the address from `server/instances/*.json` first,
 //!      falling back to the legacy `server/lock`, and read the bearer token
 //!      from `server.token` under $KIMI_CODE_HOME (default ~/.kimi-code).
-//!      kimi is version-gated (≥ 0.33); missing or outdated installs get a
+//!      kimi is version-gated (≥ 0.38); missing or outdated installs get a
 //!      guided error page;
 //!   3. navigate the main webview to the official UI on the loopback static
 //!      server (127.0.0.1:51821) — the official prebuilt web bundle,
@@ -52,6 +52,7 @@
 
 use std::{
     fs,
+    io::{Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -337,7 +338,7 @@ fn no_console(cmd: Command) -> Command {
 }
 
 /// Oldest kimi CLI paired with the official web bundle shipped by this build.
-const MIN_KIMI_VERSION: &str = "0.33.0";
+const MIN_KIMI_VERSION: &str = "0.38.0";
 
 /// Structured boot failure; the placeholder page renders it as guided steps.
 #[derive(Clone, serde::Serialize)]
@@ -1071,30 +1072,30 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Plan-usage scraping.
+// Plan quota.
 //
-// There is NO REST/cloud endpoint for membership quota (verified
-// exhaustively), but the TUI's `/usage` command renders it. So every ~10min
-// we boot a headless TUI in an EMBEDDED PTY (with a throwaway
-// KIMI_CODE_HOME holding a copy of the credentials), send `/usage`, and
-// parse the rendered screen via a vt100 parser — no external tmux needed.
+// The daemon exposes `GET /api/v1/oauth/usage` (kimi ≥ 0.38): the managed
+// account's usage windows. We poll it on a 10-minute TTL and hand raw
+// percentages plus reset timestamps to the status page, which formats the
+// remaining time in JS (Date.parse handles the ISO timestamps natively).
+// Replaces the old headless-TUI /usage screen scrape.
 // ---------------------------------------------------------------------------
 
-/// Plan quota as rendered by the TUI's `/usage`.
-#[derive(Clone, serde::Serialize)]
+/// Plan quota from `/api/v1/oauth/usage`.
+#[derive(Clone, Debug, serde::Serialize)]
 struct PlanUsage {
     weekly_pct: u32,
-    weekly_reset: String,
+    weekly_reset_at: String,
     hourly_pct: u32,
-    hourly_reset: String,
+    hourly_reset_at: String,
     fetched_at: u64,
 }
 
 static PLAN_USAGE: Mutex<Option<PlanUsage>> = Mutex::new(None);
-static SCRAPE_RUNNING: AtomicBool = AtomicBool::new(false);
+static FETCH_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Scrape TTL: the status page may ask often, we scrape at most this often.
-const SCRAPE_TTL_SECS: u64 = 600;
+/// Quota TTL: the status page may ask often, we fetch at most this often.
+const FETCH_TTL_SECS: u64 = 600;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -1103,190 +1104,118 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Parse one "X% used ... resets in Y" line of the /usage box.
-fn parse_usage_line(line: &str) -> Option<(u32, String)> {
-    let pct_end = line.find("% used")?;
-    let digits: String = line[..pct_end]
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    let pct: u32 = digits.parse().ok()?;
-    let reset = line
-        .split("resets in ")
-        .nth(1)?
-        .trim()
-        .trim_matches('│')
-        .trim()
-        .to_string();
-    Some((pct, reset))
-}
+/// Minimal blocking HTTP/1.1 GET returning the parsed JSON body. Only for
+/// loopback daemon endpoints: no TLS, no redirects, no chunked bodies (the
+/// daemon answers small JSON with Content-Length). Same std-only style as
+/// static_server.
+fn http_get_json(base: &str, path: &str, token: &str) -> Result<Value, String> {
+    let host_part = base.trim_start_matches("http://");
+    let (host, port) = host_part
+        .rsplit_once(':')
+        .ok_or_else(|| format!("daemon 地址缺少端口：{base}"))?;
+    let port: u16 = port.parse().map_err(|_| format!("daemon 端口无效：{port}"))?;
 
-/// Copy a file or directory tree (small credential dirs only).
-fn copy_tree(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
-    if src.is_dir() {
-        fs::create_dir_all(dst)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
-        }
-    } else if src.is_file() {
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(src, dst)?;
-    }
-    Ok(())
-}
-
-/// Spawn `program` in an embedded PTY, dismiss first-run dialogs, send
-/// `input`, and return the final rendered screen via a vt100 parser
-/// (same fidelity as `tmux capture-pane`, but zero external dependencies).
-fn run_in_pty(
-    program: &PathBuf,
-    cwd: &PathBuf,
-    envs: &[(&str, &str)],
-    input: &str,
-    boot_wait: Duration,
-    after_input_wait: Duration,
-) -> Result<String, String> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-    use std::io::{Read, Write};
-
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 50,
-            cols: 200,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
+    let mut stream = TcpStream::connect((host, port)).map_err(|e| format!("连接 daemon 失败：{e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
-    let mut cmd = CommandBuilder::new(program);
-    cmd.cwd(cwd);
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("spawn 失败：{e}"))?;
-    drop(pair.slave);
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("发送请求失败：{e}"))?;
 
-    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    thread::spawn(move || {
-        let mut buf = [0u8; 16384];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-    thread::sleep(boot_wait);
-    // Dismiss any first-run dialog (e.g. kimi-cli migration prompt).
-    let _ = writer.write_all(b"\x1b");
-    thread::sleep(Duration::from_millis(800));
-    let _ = writer.write_all(input.as_bytes());
-    let _ = writer.write_all(b"\r");
-    thread::sleep(after_input_wait);
-
-    let _ = child.kill();
-    let _ = child.wait();
-    drop(writer);
-    thread::sleep(Duration::from_millis(300));
     let mut raw = Vec::new();
-    while let Ok(chunk) = rx.try_recv() {
-        raw.extend_from_slice(&chunk);
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("读取响应失败：{e}"))?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "daemon 响应缺少头部分隔".to_string())?;
+    if !head.starts_with("HTTP/1.1 200") {
+        let status = head.lines().next().unwrap_or("");
+        return Err(format!("daemon 响应非 200：{status}"));
     }
-    let mut parser = vt100::Parser::new(50, 200, 0);
-    parser.process(&raw);
-    Ok(parser.screen().contents())
+    serde_json::from_str(body).map_err(|e| format!("解析 JSON 失败：{e}"))
 }
 
-/// Boot a headless TUI in an embedded PTY, send /usage, parse the output.
-/// Takes ~10s.
-fn scrape_plan_usage() -> Result<PlanUsage, String> {
-    let kimi = find_kimi().ok_or("找不到 kimi CLI")?;
+/// One usage window row: `summary` or an entry of `limits[]`.
+fn row_pct(row: &Value) -> Option<u32> {
+    let used = row["used"].as_f64()?;
+    let limit = row["limit"].as_f64()?;
+    (limit > 0.0).then(|| (used / limit * 100.0).round() as u32)
+}
 
-    // Throwaway home with a copy of the credentials, so probe sessions and
-    // their junk never touch the user's real data directory.
-    let sandbox = std::env::temp_dir().join(format!("kimi-usage-home-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&sandbox);
-    fs::create_dir_all(&sandbox).map_err(|e| e.to_string())?;
-    let real_home = kimi_home();
-    // Migration markers and device id included so the sandboxed TUI does not
-    // stop at first-run dialogs; an Escape is sent anyway as a fallback.
-    for item in ["config.toml", "credentials", "oauth", "device_id", "migration-report.json"] {
-        let src = real_home.join(item);
-        if src.exists() {
-            let _ = copy_tree(&src, &sandbox.join(item));
-        }
+fn row_reset_at(row: &Value) -> String {
+    row["reset_at"].as_str().unwrap_or("").to_string()
+}
+
+fn row_is_weekly(row: &Value) -> bool {
+    (row["window"]["unit"].as_str() == Some("week"))
+        || row["name"].as_str().map_or(false, |n| n.to_lowercase().contains("week"))
+}
+
+fn row_is_hourly(row: &Value) -> bool {
+    let window = &row["window"];
+    (window["duration"].as_u64() == Some(5) && window["unit"].as_str() == Some("hour"))
+        || row["name"].as_str().map_or(false, |n| n.to_lowercase().contains("5h"))
+}
+
+/// Extract (weekly pct, weekly reset, hourly pct, hourly reset) from the
+/// `/oauth/usage` data object. The weekly row may live in `summary` or in
+/// `limits[]` depending on account shape — consider both.
+fn extract_plan_usage(data: &Value) -> Result<PlanUsage, String> {
+    if data["kind"].as_str() == Some("error") {
+        let msg = data["message"].as_str().unwrap_or("未知错误");
+        return Err(format!("额度接口返回错误：{msg}"));
     }
-    let probe = sandbox.join("probe");
-    fs::create_dir_all(&probe).map_err(|e| e.to_string())?;
-
-    let home_str = sandbox.display().to_string();
-    let result = run_in_pty(
-        &kimi,
-        &probe,
-        &[("KIMI_CODE_HOME", home_str.as_str())],
-        "/usage",
-        Duration::from_secs(6),
-        Duration::from_secs(4),
-    );
-    let _ = fs::remove_dir_all(&sandbox);
-    let text = result?;
-
-    let mut weekly = None;
-    let mut hourly = None;
-    for line in text.lines() {
-        if line.contains("Weekly limit") {
-            weekly = parse_usage_line(line);
-        } else if line.contains("5h limit") {
-            hourly = parse_usage_line(line);
-        }
+    let mut rows: Vec<&Value> = Vec::new();
+    if data["summary"].is_object() {
+        rows.push(&data["summary"]);
     }
+    if let Some(limits) = data["limits"].as_array() {
+        rows.extend(limits);
+    }
+    let weekly = rows.iter().find(|r| row_is_weekly(r) && row_pct(r).is_some());
+    let hourly = rows.iter().find(|r| row_is_hourly(r) && row_pct(r).is_some());
     match (weekly, hourly) {
-        (Some((weekly_pct, weekly_reset)), Some((hourly_pct, hourly_reset))) => Ok(PlanUsage {
-            weekly_pct,
-            weekly_reset,
-            hourly_pct,
-            hourly_reset,
+        (Some(w), Some(h)) => Ok(PlanUsage {
+            weekly_pct: row_pct(w).unwrap_or(0),
+            weekly_reset_at: row_reset_at(w),
+            hourly_pct: row_pct(h).unwrap_or(0),
+            hourly_reset_at: row_reset_at(h),
             fetched_at: now_secs(),
         }),
-        _ => Err("解析 /usage 输出失败（TUI 格式可能已变化）".to_string()),
+        _ => Err("额度响应缺少每周或 5 小时窗口行（接口结构可能已变化）".to_string()),
     }
 }
 
-/// The status page asks for plan quota; we return the cache and refresh it
-/// in the background when stale.
+/// The status page asks for plan quota; we return the cache and refresh it in
+/// the background when stale.
 #[tauri::command]
-fn plan_usage() -> Value {
+fn plan_usage(state: tauri::State<'_, SharedDaemon>) -> Value {
+    let Some(daemon) = state.lock().ok().and_then(|g| g.clone()) else {
+        return serde_json::json!({ "loading": true });
+    };
     let stale = PLAN_USAGE
         .lock()
-        .map(|u| u.as_ref().map_or(true, |u| u.fetched_at + SCRAPE_TTL_SECS < now_secs()))
+        .map(|u| u.as_ref().map_or(true, |u| u.fetched_at + FETCH_TTL_SECS < now_secs()))
         .unwrap_or(true);
-    if stale && !SCRAPE_RUNNING.swap(true, Ordering::Relaxed) {
-        thread::spawn(|| {
-            match scrape_plan_usage() {
+    if stale && !FETCH_RUNNING.swap(true, Ordering::Relaxed) {
+        thread::spawn(move || {
+            match http_get_json(&daemon.base, "/api/v1/oauth/usage", &daemon.token)
+                .and_then(|v| extract_plan_usage(&v["data"]))
+            {
                 Ok(u) => {
                     if let Ok(mut guard) = PLAN_USAGE.lock() {
                         *guard = Some(u);
                     }
                 }
-                Err(e) => eprintln!("kimi-ui: 额度抓取失败：{e}"),
+                Err(e) => eprintln!("kimi-ui: 额度获取失败：{e}"),
             }
-            SCRAPE_RUNNING.store(false, Ordering::Relaxed);
+            FETCH_RUNNING.store(false, Ordering::Relaxed);
         });
     }
     let guard = PLAN_USAGE.lock().ok();
@@ -1496,9 +1425,9 @@ mod tests {
 
     #[test]
     fn enforces_minimum_kimi_version() {
-        assert!(version_older("0.32.9", MIN_KIMI_VERSION));
-        assert!(!version_older("0.33.0", MIN_KIMI_VERSION));
-        assert!(!version_older("0.33.1", MIN_KIMI_VERSION));
+        assert!(version_older("0.37.9", MIN_KIMI_VERSION));
+        assert!(!version_older("0.38.0", MIN_KIMI_VERSION));
+        assert!(!version_older("0.38.1", MIN_KIMI_VERSION));
         assert!(!version_older("1.0.0", MIN_KIMI_VERSION));
     }
 
@@ -1509,5 +1438,95 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(query, "?kimi_desktop&platform=darwin");
         }
+    }
+
+    /// Real `/api/v1/oauth/usage` shape captured from a 0.38.0 daemon: the
+    /// weekly row lives in `summary`, the 5h row in `limits[]`.
+    const OAUTH_USAGE_SAMPLE: &str = r#"{
+        "kind": "ok",
+        "summary": {"window": {"duration": 1, "unit": "week"}, "used": 3, "limit": 100,
+                    "reset_at": "2026-08-29T13:17:18Z"},
+        "limits": [{"window": {"duration": 5, "unit": "hour"}, "used": 7, "limit": 200,
+                    "reset_at": "2026-08-23T19:17:18Z"}],
+        "extra_usage": null
+    }"#;
+
+    #[test]
+    fn extracts_plan_usage_from_oauth_response() {
+        let data: Value = serde_json::from_str(OAUTH_USAGE_SAMPLE).unwrap();
+        let plan = extract_plan_usage(&data).unwrap();
+        assert_eq!(plan.weekly_pct, 3);
+        assert_eq!(plan.hourly_pct, 4); // 7/200 rounds to 4%
+        assert_eq!(plan.weekly_reset_at, "2026-08-29T13:17:18Z");
+        assert_eq!(plan.hourly_reset_at, "2026-08-23T19:17:18Z");
+    }
+
+    #[test]
+    fn oauth_usage_rows_are_matched_by_name_when_window_missing() {
+        let data: Value = serde_json::from_str(
+            r#"{"kind":"ok","summary":null,
+                "limits":[{"name":"Weekly limit","used":50,"limit":100},
+                          {"name":"5h limit","used":10,"limit":100}]}"#,
+        )
+        .unwrap();
+        let plan = extract_plan_usage(&data).unwrap();
+        assert_eq!(plan.weekly_pct, 50);
+        assert_eq!(plan.hourly_pct, 10);
+    }
+
+    #[test]
+    fn oauth_usage_error_and_missing_rows_are_rejected() {
+        let err: Value =
+            serde_json::from_str(r#"{"kind":"error","message":"not logged in"}"#).unwrap();
+        assert!(extract_plan_usage(&err).unwrap_err().contains("not logged in"));
+        let partial: Value = serde_json::from_str(
+            r#"{"kind":"ok","summary":null,
+                "limits":[{"window":{"duration":1,"unit":"week"},"used":1,"limit":10}]}"#,
+        )
+        .unwrap();
+        assert!(extract_plan_usage(&partial).is_err());
+    }
+
+    /// http_get_json over a real socket: request carries the bearer token,
+    /// response body is parsed as JSON.
+    #[test]
+    fn http_get_json_roundtrip() {
+        use std::io::{Read as _, Write as _};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(request.starts_with("GET /api/v1/oauth/usage HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer t0ken"));
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .unwrap();
+        });
+        let value = http_get_json(
+            &format!("http://127.0.0.1:{port}"),
+            "/api/v1/oauth/usage",
+            "t0ken",
+        )
+        .unwrap();
+        assert_eq!(value["ok"], true);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_get_json_rejects_error_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+        });
+        let err = http_get_json(&format!("http://127.0.0.1:{port}"), "/", "x").unwrap_err();
+        assert!(err.contains("401"), "{err}");
     }
 }

@@ -4,6 +4,14 @@
 打 `v*` tag 发版时，CI 自动截取对应段落作为 GitHub Release 的 notes；
 应用内"更新提示"卡片展示的也是这里的内容。版本说明一律使用中文。
 
+## 0.1.15 - 2026-08-24
+
+- 官方 Web bundle 从 `@moonshot-ai/kimi-code@0.33.0` 升级至 `@moonshot-ai/kimi-code@0.38.0`，跟随官方 8 个 release 的界面与协议更新
+- 最低 Kimi Code CLI 版本提升至 0.38.0，旧版本启动时引导执行 `kimi upgrade`
+- 入口 JS 性能预算从 2.5 MiB 调整为 3 MiB：官方 0.33.0 → 0.38.0 入口 JS 增长 34%（2,092,189 → 2,808,393 bytes），属官方功能增长，其余指标均在原预算内
+- 套餐额度改用官方 daemon 接口 `GET /api/v1/oauth/usage`，移除无头 TUI PTY 抓屏方案与 `portable-pty`、`vt100` 依赖；重置时间按剩余时长在状态栏本地格式化
+- 升级前已核对全部壳耦合点：daemon 发现（server/instances 注册表与 server.token）、`kimi web --port/--no-open` 参数、`kimi_origin` 桌面交接、状态栏 v1 REST/WS 接口均未变化；官方新增的 `/api/v2` 与 v1 并存，已记录迁移风险
+
 ## 0.1.14 - 2026-08-06
 
 - 优化官方 Web 长会话渲染：用户 turn 与助手消息启用 `content-visibility`，真实 WKWebView 合成长历史基准的视口外布局耗时降低 25.8%

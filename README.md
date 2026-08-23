@@ -27,7 +27,7 @@
 
 ```bash
 git clone https://github.com/liujunGH/kimi-ui.git
-git clone --branch '@moonshot-ai/kimi-code@0.33.0' --depth 1 https://github.com/MoonshotAI/kimi-code.git
+git clone --branch '@moonshot-ai/kimi-code@0.38.0' --depth 1 https://github.com/MoonshotAI/kimi-code.git
 
 cd kimi-ui
 KIMI_CODE_REPO=../kimi-code bash scripts/build-web.sh  # 同步官方 dist-web
@@ -38,25 +38,25 @@ bash packaging/make-app.sh --install                  # 编译、组包并安装
 
 ## 工作原理
 
-1. 检查 kimi CLI 是否安装及版本（< 0.33 引导 `kimi upgrade`，未安装引导官方文档）
+1. 检查 kimi CLI 是否安装及版本（< 0.38 引导 `kimi upgrade`，未安装引导官方文档）
 2. 发现已有服务实例则直接 attach；否则选择空闲端口并后台拉起 `kimi web --no-open`（App 退出时回收），再从 `server/instances` 注册表（回退旧版 `server/lock`，TCP 探活跳过失效项）发现地址、读取访问凭据
 3. 内置静态服务（127.0.0.1:51821，避开官方 daemon 的 58627+ 端口段）托管官方 web 包（release 编译期内嵌进 exe，单文件分发；开发时从 web-dist 磁盘读取），通过官方支持的 `kimi_origin` 参数和 URL hash 交接 daemon 地址与凭据；稳定 origin 保留界面偏好，内容哈希资源使用长期缓存，包缺失时回退 daemon 内嵌官方 UI
 4. 状态栏是壳自有页面，直连 daemon REST/WebSocket；注入脚本只补桌面能力（通知、拖拽等）；更新提示带版本说明（Release notes 由 CI 自动生成）
 
 ## 与上游的关系
 
-- Web UI 直接取自官方 `@moonshot-ai/kimi-code@0.33.0` 的 `apps/kimi-code/dist-web`
+- Web UI 直接取自官方 `@moonshot-ai/kimi-code@0.38.0` 的 `apps/kimi-code/dist-web`
 - 旧 `liujunGH/kimi-code` 的 `kimi-ui` 分支仅作为历史备份，不再 rebase 或发版
 - 界面与协议问题提交 Kimi Code 上游；本仓只维护桌面窗口、原生桥接、状态栏和打包
 
 ## 维护说明
 
-DOM/协议耦合点的失效都有三层看门狗告警（拖拽布局、状态栏 REST/WS、额度抓屏格式），壳侧修复点集中在 `src/main.rs` 的 `INIT_SCRIPT`；官方改版最坏情况是功能退回原生行为，不会静默出错。同步 bundle 会自动执行资源预算门禁，性能基线、真实体验清单和上游待办见 [docs/performance.md](docs/performance.md)。
+DOM/协议耦合点的失效都有看门狗告警（拖拽布局、状态栏 REST/WS、套餐额度接口），壳侧修复点集中在 `src/main.rs` 的 `INIT_SCRIPT`；官方改版最坏情况是功能退回原生行为，不会静默出错。同步 bundle 会自动执行资源预算门禁，性能基线、真实体验清单和上游待办见 [docs/performance.md](docs/performance.md)。
 
 ## 目录结构
 
 ```
-src/main.rs            # 壳逻辑（窗口布局、静态服务、注入脚本、命令、额度采集、更新检查）
+src/main.rs            # 壳逻辑（窗口布局、静态服务、注入脚本、命令、套餐额度、更新检查）
 src/static_server.rs   # 零依赖静态服务（托管 web-dist）
 public/index.html      # 启动占位页
 public/status.html     # 壳自有的本地受信状态栏

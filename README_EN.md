@@ -27,7 +27,7 @@ Requires this repo plus a `kimi-code` checkout pinned to the official release ta
 
 ```bash
 git clone https://github.com/liujunGH/kimi-ui.git
-git clone --branch '@moonshot-ai/kimi-code@0.33.0' --depth 1 https://github.com/MoonshotAI/kimi-code.git
+git clone --branch '@moonshot-ai/kimi-code@0.38.0' --depth 1 https://github.com/MoonshotAI/kimi-code.git
 
 cd kimi-ui
 KIMI_CODE_REPO=../kimi-code bash scripts/build-web.sh  # stage official dist-web
@@ -38,25 +38,25 @@ Requires a Rust toolchain; Node/pnpm is no longer needed. Set `KIMI_CODE_REPO` w
 
 ## How it works
 
-1. Requires Kimi Code CLI 0.33 or newer, attaching to a live server or launching `kimi web --no-open` on an explicitly selected free port
+1. Requires Kimi Code CLI 0.38 or newer, attaching to a live server or launching `kimi web --no-open` on an explicitly selected free port
 2. Reads the daemon's address and credential from kimi's local data directory
 3. Serves the official web bundle on a stable shell-owned origin (127.0.0.1:51821, outside Kimi's 58627+ daemon range), handing over the daemon via the official `kimi_origin` parameter and the credential via the URL hash; the stable origin preserves UI preferences, content-hashed assets use long-lived caching, and a missing bundle falls back to the daemon-hosted UI
 4. The status bar is the shell's own page talking to the daemon over REST/WebSocket; the injected script only adds desktop behaviors (notifications, dragging, etc.)
 
 ## Relationship with upstream
 
-- The Web UI comes directly from `apps/kimi-code/dist-web` at official tag `@moonshot-ai/kimi-code@0.33.0`
+- The Web UI comes directly from `apps/kimi-code/dist-web` at official tag `@moonshot-ai/kimi-code@0.38.0`
 - The old `liujunGH/kimi-code` branch `kimi-ui` remains only as a historical backup; it is no longer rebased or released
 - UI and protocol issues go upstream; this repo maintains only the desktop window, native bridge, status bar, and packaging
 
 ## Maintenance notes
 
-A three-layer watchdog warns loudly when official updates drift the DOM selectors, the status-bar REST/WS protocol, or the `/usage` scrape format. Shell-side fixes are concentrated in `src/main.rs` (`INIT_SCRIPT`). Worst case after an official update: a feature degrades to stock behavior — never silent breakage. Bundle staging also enforces resource-size budgets; see [docs/performance.md](docs/performance.md) for the baseline, real-app checklist, and upstream work.
+A three-layer watchdog warns loudly when official updates drift the DOM selectors, the status-bar REST/WS protocol, or the plan-quota endpoint. Shell-side fixes are concentrated in `src/main.rs` (`INIT_SCRIPT`). Worst case after an official update: a feature degrades to stock behavior — never silent breakage. Bundle staging also enforces resource-size budgets; see [docs/performance.md](docs/performance.md) for the baseline, real-app checklist, and upstream work.
 
 ## Layout
 
 ```
-src/main.rs            # shell logic (window layout, static server, injected script, commands, quota scrape, update check)
+src/main.rs            # shell logic (window layout, static server, injected script, commands, plan quota, update check)
 src/static_server.rs   # dependency-free static server (serves web-dist)
 public/index.html      # launch placeholder page
 public/status.html     # shell-owned trusted local status bar
