@@ -4,6 +4,13 @@
 打 `v*` tag 发版时，CI 自动截取对应段落作为 GitHub Release 的 notes；
 应用内"更新提示"卡片展示的也是这里的内容。版本说明一律使用中文。
 
+## 0.1.16 - 2026-08-27
+
+- 官方 Web bundle 从 `@moonshot-ai/kimi-code@0.38.0` 升级至 `@moonshot-ai/kimi-code@0.39.0`：新增 Remote Control（实验）、Tower 多 agent 编排（实验）、subagent fork（实验），web 右侧栏改为多标签面板，并修复同会话多客户端消息不同步、恢复中断会话反复崩溃、反复切换会话内存持续增长等问题
+- 最低 Kimi Code CLI 版本提升至 0.39.0，旧版本启动时引导执行 `kimi upgrade`
+- 升级前已核对全部壳耦合点：daemon 的 `/api/v1` REST 与 WS v1 在 0.39.0 仍默认挂载，`/api/v1/oauth/usage` 接口与 `kimi_origin` 桌面交接均未变化；入口 JS 2,808,393 → 3,101,530 bytes，仍在 3 MiB 预算内
+- 启动 attach 时跳过版本低于已安装 CLI 的旧 daemon，改为拉起新的 `kimi web`：CLI 升级后重启 App 即生效，不再静默连用旧 server；被跳过的旧 daemon 经官方 `/api/v1/shutdown` 优雅关停（best-effort），不再长期占用端口与内存
+
 ## 0.1.15 - 2026-08-24
 
 - 官方 Web bundle 从 `@moonshot-ai/kimi-code@0.33.0` 升级至 `@moonshot-ai/kimi-code@0.38.0`，跟随官方 8 个 release 的界面与协议更新
