@@ -8,11 +8,16 @@
 //! Launch flow:
 //!   1. open a window with a tiny local placeholder page immediately;
 //!   2. on a background thread, attach to an already-running server if one
-//!      exists; otherwise spawn `kimi web --no-open` and kill that child on
-//!      app exit. Discover the address from `server/instances/*.json` first,
+//!      exists and is not older than the installed CLI (a stale daemon whose
+//!      `host_version` lags the CLI is skipped and gracefully shut down via
+//!      its own `/api/v1/shutdown`, so a `kimi upgrade` actually takes effect
+//!      on the next launch instead of silently attaching to the old server);
+//!      otherwise spawn `kimi web --no-open` and kill that child
+//!      on app exit. Discover the address from `server/instances/*.json`
+//!      first,
 //!      falling back to the legacy `server/lock`, and read the bearer token
 //!      from `server.token` under $KIMI_CODE_HOME (default ~/.kimi-code).
-//!      kimi is version-gated (≥ 0.38); missing or outdated installs get a
+//!      kimi is version-gated (≥ 0.39); missing or outdated installs get a
 //!      guided error page;
 //!   3. navigate the main webview to the official UI on the loopback static
 //!      server (127.0.0.1:51821) — the official prebuilt web bundle,
@@ -338,7 +343,7 @@ fn no_console(cmd: Command) -> Command {
 }
 
 /// Oldest kimi CLI paired with the official web bundle shipped by this build.
-const MIN_KIMI_VERSION: &str = "0.38.0";
+const MIN_KIMI_VERSION: &str = "0.39.0";
 
 /// Structured boot failure; the placeholder page renders it as guided steps.
 #[derive(Clone, serde::Serialize)]
@@ -362,7 +367,11 @@ static SPAWNED_SERVER: Mutex<Option<Child>> = Mutex::new(None);
 /// Ensure a local server is running and build its address/credentials.
 ///
 ///   1. attach to an already-running server (the user's own `kimi web`, or a
-///      daemon from an older CLI) — no subprocess at all;
+///      daemon from an older CLI) — no subprocess at all, unless the daemon
+///      is positively older than the installed CLI: stale daemons are skipped
+///      and then gracefully shut down via their own `/api/v1/shutdown` route,
+///      so upgrading the CLI actually moves the app onto a fresh server and
+///      the old one stops pinning its port;
 ///   2. spawn `kimi web --no-open` ourselves and wait (≤15s, bailing early
 ///      if the child dies) for it to register under `server/instances/`.
 fn connect_daemon() -> Result<Launch, BootError> {
@@ -378,7 +387,8 @@ fn connect_daemon() -> Result<Launch, BootError> {
     }
 
     let home = kimi_home();
-    if let Ok(launch) = attach(&home) {
+    if let Ok(launch) = attach(&home, version.as_deref()) {
+        shutdown_stale_daemons(&home, version.as_deref(), &launch.token);
         return Ok(launch);
     }
 
@@ -397,6 +407,7 @@ fn connect_daemon() -> Result<Launch, BootError> {
             if let Ok(mut guard) = SPAWNED_SERVER.lock() {
                 *guard = Some(child);
             }
+            shutdown_stale_daemons(&home, version.as_deref(), &launch.token);
             Ok(launch)
         }
         Err(e) => {
@@ -411,8 +422,8 @@ fn connect_daemon() -> Result<Launch, BootError> {
 }
 
 /// Attach to a reachable daemon (single attempt) and build the launch params.
-fn attach(home: &Path) -> Result<Launch, String> {
-    let addr = discover_daemon(home)?;
+fn attach(home: &Path, cli_version: Option<&str>) -> Result<Launch, String> {
+    let addr = discover_daemon(home, cli_version)?;
     launch_at(home, addr)
 }
 
@@ -558,13 +569,24 @@ fn tcp_alive(host: &str, port: u16) -> bool {
     addrs.any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
 }
 
+/// A daemon is stale when we positively know both versions and the daemon's
+/// `host_version` is older than the installed CLI. Unknown/missing versions
+/// keep the legacy attach behavior — only a proven downgrade skips.
+fn daemon_stale(host_version: Option<&str>, cli_version: Option<&str>) -> bool {
+    match (host_version, cli_version) {
+        (Some(d), Some(c)) => version_older(d, c),
+        _ => false,
+    }
+}
+
 /// Discover a live daemon address: scan the multi-instance registry
 /// (`server/instances/*.json`, longest-running first), then fall back to the
 /// legacy single-instance `server/lock`. Mirrors kap-server's own discovery
 /// order (`packages/kap-server/src/instanceRegistry.ts`). Every candidate is
 /// verified with a TCP connect, so stale files from crashed daemons are
-/// skipped instead of fatal.
-fn discover_daemon(home: &Path) -> Result<DaemonAddr, String> {
+/// skipped instead of fatal. Daemons older than the installed CLI are skipped
+/// too, so an upgraded CLI is not shadowed by a long-running old server.
+fn discover_daemon(home: &Path, cli_version: Option<&str>) -> Result<DaemonAddr, String> {
     let mut candidates: Vec<(u64, String, u16)> = Vec::new();
 
     if let Ok(rd) = fs::read_dir(home.join("server/instances")) {
@@ -578,6 +600,9 @@ fn discover_daemon(home: &Path) -> Result<DaemonAddr, String> {
             let Ok(v) = serde_json::from_str::<Value>(&raw) else {
                 continue;
             };
+            if daemon_stale(v["host_version"].as_str(), cli_version) {
+                continue;
+            }
             let Some(port) = v["port"].as_u64().and_then(|p| u16::try_from(p).ok()) else {
                 continue;
             };
@@ -592,8 +617,10 @@ fn discover_daemon(home: &Path) -> Result<DaemonAddr, String> {
     // so it always sorts after every registry instance.
     if let Ok(raw) = fs::read_to_string(home.join("server/lock")) {
         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            if let Some(port) = v["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {
-                candidates.push((u64::MAX, normalize_host(v["host"].as_str()), port));
+            if !daemon_stale(v["host_version"].as_str(), cli_version) {
+                if let Some(port) = v["port"].as_u64().and_then(|p| u16::try_from(p).ok()) {
+                    candidates.push((u64::MAX, normalize_host(v["host"].as_str()), port));
+                }
             }
         }
     }
@@ -604,6 +631,71 @@ fn discover_daemon(home: &Path) -> Result<DaemonAddr, String> {
         }
     }
     Err("没有发现可达的 kimi daemon（server/instances 与 server/lock 均无效）".to_string())
+}
+
+/// Reachable daemons proven older than the installed CLI — the ones
+/// discover_daemon skipped. Scans the same registry + legacy lock.
+fn stale_daemons(home: &Path, cli_version: Option<&str>) -> Vec<DaemonAddr> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(home.join("server/instances")) {
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".json") {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.push(home.join("server/lock"));
+
+    let mut stale = Vec::new();
+    for path in paths {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if !daemon_stale(v["host_version"].as_str(), cli_version) {
+            continue;
+        }
+        let Some(port) = v["port"].as_u64().and_then(|p| u16::try_from(p).ok()) else {
+            continue;
+        };
+        let host = normalize_host(v["host"].as_str());
+        if tcp_alive(&host, port) {
+            stale.push(DaemonAddr { host, port });
+        }
+    }
+    stale
+}
+
+/// Ask one daemon to exit via its own graceful route (`POST /api/v1/shutdown`
+/// — loopback-only and bearer-authenticated, so no pid-reuse risk, and the
+/// same mechanism the official `kimi server kill` fallback uses). The server
+/// closes the connection as it exits, so every IO/response error is normal
+/// and ignored.
+fn shutdown_daemon(addr: &DaemonAddr, token: &str) {
+    let request = format!(
+        "POST /api/v1/shutdown HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        addr.host, addr.port
+    );
+    let Ok(mut stream) = TcpStream::connect((addr.host.as_str(), addr.port)) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    if stream.write_all(request.as_bytes()).is_err() {
+        return;
+    }
+    let mut buf = [0u8; 512];
+    let _ = stream.read(&mut buf);
+}
+
+/// Shut down stale daemons once a good server is secured. They were skipped
+/// during attach, so leaving them running only pins their ports and memory.
+/// Best-effort: failures just mean the stale daemon stays up as before.
+fn shutdown_stale_daemons(home: &Path, cli_version: Option<&str>, token: &str) {
+    for addr in stale_daemons(home, cli_version) {
+        shutdown_daemon(&addr, token);
+    }
 }
 
 /// Dev-only: the official Kimi Code web bundle on disk —
@@ -1275,9 +1367,117 @@ mod tests {
             ),
         )
         .unwrap();
-        let addr = discover_daemon(&home).unwrap();
+        let addr = discover_daemon(&home, None).unwrap();
         assert_eq!(addr.port, p1);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn skips_stale_daemon_older_than_cli() {
+        let home = temp_home("stale");
+        let (_l1, stale_port) = live_port();
+        let (_l2, fresh_port) = live_port();
+        fs::write(
+            home.join("server/instances/stale.json"),
+            format!(
+                r#"{{"server_id":"stale","pid":1,"host":"127.0.0.1","port":{stale_port},"started_at":100,"host_version":"0.36.1"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("server/instances/fresh.json"),
+            format!(
+                r#"{{"server_id":"fresh","pid":1,"host":"127.0.0.1","port":{fresh_port},"started_at":200,"host_version":"0.39.0"}}"#
+            ),
+        )
+        .unwrap();
+        // Stale daemon is skipped even though it is the longest-running.
+        let addr = discover_daemon(&home, Some("0.39.0")).unwrap();
+        assert_eq!(addr.port, fresh_port);
+        // Without a known CLI version the legacy attach behavior is kept.
+        let addr = discover_daemon(&home, None).unwrap();
+        assert_eq!(addr.port, stale_port);
+        // An equal or newer daemon is still attached.
+        let addr = discover_daemon(&home, Some("0.36.1")).unwrap();
+        assert_eq!(addr.port, stale_port);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn stale_lock_only_is_rejected() {
+        let home = temp_home("stale-lock");
+        fs::remove_dir_all(home.join("server/instances")).unwrap();
+        let (_listener, port) = live_port();
+        fs::write(
+            home.join("server/lock"),
+            format!(
+                r#"{{"pid":1,"host":"127.0.0.1","port":{port},"host_version":"0.38.0"}}"#
+            ),
+        )
+        .unwrap();
+        assert!(discover_daemon(&home, Some("0.39.0")).is_err());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn stale_daemons_lists_only_live_stale_servers() {
+        let home = temp_home("stale-list");
+        let (_l1, stale_port) = live_port();
+        let (_l2, fresh_port) = live_port();
+        fs::write(
+            home.join("server/instances/stale.json"),
+            format!(
+                r#"{{"server_id":"stale","pid":1,"host":"127.0.0.1","port":{stale_port},"started_at":100,"host_version":"0.36.1"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("server/instances/fresh.json"),
+            format!(
+                r#"{{"server_id":"fresh","pid":1,"host":"127.0.0.1","port":{fresh_port},"started_at":200,"host_version":"0.39.0"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("server/instances/stale-dead.json"),
+            format!(
+                r#"{{"server_id":"stale-dead","pid":1,"host":"127.0.0.1","port":{},"started_at":300,"host_version":"0.36.1"}}"#,
+                dead_port()
+            ),
+        )
+        .unwrap();
+        let stale = stale_daemons(&home, Some("0.39.0"));
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].port, stale_port);
+        // No CLI version known → nothing is provably stale → nothing to kill.
+        assert!(stale_daemons(&home, None).is_empty());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// shutdown_daemon over a real socket: the request is the graceful
+    /// shutdown route carrying the bearer token.
+    #[test]
+    fn shutdown_daemon_posts_shutdown_route() {
+        use std::io::Read as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(request.starts_with("POST /api/v1/shutdown HTTP/1.1"));
+            assert!(request.contains("Authorization: Bearer t0ken"));
+            // Exit like a real daemon: close without answering.
+        });
+        shutdown_daemon(
+            &DaemonAddr {
+                host: "127.0.0.1".to_string(),
+                port,
+            },
+            "t0ken",
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -1297,7 +1497,7 @@ mod tests {
             format!(r#"{{"pid":1,"host":"127.0.0.1","port":{lock_port}}}"#),
         )
         .unwrap();
-        let addr = discover_daemon(&home).unwrap();
+        let addr = discover_daemon(&home, None).unwrap();
         assert_eq!(addr.port, lock_port);
         let _ = fs::remove_dir_all(&home);
     }
@@ -1315,7 +1515,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let addr = discover_daemon(&home).unwrap();
+        let addr = discover_daemon(&home, None).unwrap();
         assert_eq!(addr.port, port);
         assert_eq!(addr.host, "127.0.0.1");
         let _ = fs::remove_dir_all(&home);
@@ -1339,7 +1539,7 @@ mod tests {
             format!(r#"{{"pid":1,"host":"127.0.0.1","port":{}}}"#, dead_port()),
         )
         .unwrap();
-        assert!(discover_daemon(&home).is_err());
+        assert!(discover_daemon(&home, None).is_err());
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -1425,9 +1625,9 @@ mod tests {
 
     #[test]
     fn enforces_minimum_kimi_version() {
-        assert!(version_older("0.37.9", MIN_KIMI_VERSION));
-        assert!(!version_older("0.38.0", MIN_KIMI_VERSION));
-        assert!(!version_older("0.38.1", MIN_KIMI_VERSION));
+        assert!(version_older("0.38.9", MIN_KIMI_VERSION));
+        assert!(!version_older("0.39.0", MIN_KIMI_VERSION));
+        assert!(!version_older("0.39.1", MIN_KIMI_VERSION));
         assert!(!version_older("1.0.0", MIN_KIMI_VERSION));
     }
 
