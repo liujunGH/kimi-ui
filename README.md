@@ -8,7 +8,10 @@
 
 - **独立应用形态**：独立窗口、Dock 图标、Cmd-Tab、关窗即整体退出；hidden-inset 标题栏，拖拽区/双击缩放齐全
 - **官方 Web UI**：直接跟随 Kimi Code release 的预构建 bundle，界面功能、协议与官方版本保持一致
-- **壳自有状态栏**：本地受信 WebView 展示上下文用量、套餐额度（5h/每周）、忙闲灯、蜂群名册（子代理实时状态）、跟随/静止开关和更新提示徽标
+- **原生菜单栏**：应用/文件/编辑/会话/窗口/帮助中文菜单，⌘N 新建会话；"会话"菜单动态列出最近会话，点击直达
+- **会话感知窗口标题**：标题跟随当前会话，Cmd-Tab 与调度中心一眼可辨
+- **壳自有状态栏**：本地受信 WebView 展示上下文用量、套餐额度（5h/每周）、忙闲灯、跟随/静止开关和更新提示徽标
+- **Remote Control 包装**（官方实验特性）：一键拉起 `kimi rc`，展示访问链接与二维码，从手机或其他电脑继续本机会话
 - **原生通知 + Dock 角标**：完成/提问/审批走 macOS 通知，未读计数显示在 Dock
 - **下载与外链**：会话导出自动存 `~/Downloads` 去重；外部链接走系统浏览器
 - **界面自愈与三层看门狗**：官方改版导致 DOM/协议/格式漂移时明确告警，不静默坏掉
@@ -27,7 +30,7 @@
 
 ```bash
 git clone https://github.com/liujunGH/kimi-ui.git
-git clone --branch '@moonshot-ai/kimi-code@0.39.0' --depth 1 https://github.com/MoonshotAI/kimi-code.git
+git clone --branch '@moonshot-ai/kimi-code@0.39.1' --depth 1 https://github.com/MoonshotAI/kimi-code.git
 
 cd kimi-ui
 KIMI_CODE_REPO=../kimi-code bash scripts/build-web.sh  # 同步官方 dist-web
@@ -38,14 +41,14 @@ bash packaging/make-app.sh --install                  # 编译、组包并安装
 
 ## 工作原理
 
-1. 检查 kimi CLI 是否安装及版本（< 0.39 引导 `kimi upgrade`，未安装引导官方文档）
+1. 检查 kimi CLI 是否安装及版本（< 0.39.1 引导 `kimi upgrade`，未安装引导官方文档）
 2. 发现已有服务实例则直接 attach（版本低于已安装 CLI 的旧 daemon 会被跳过并优雅关停，保证升级生效）；否则选择空闲端口并后台拉起 `kimi web --no-open`（App 退出时回收），再从 `server/instances` 注册表（回退旧版 `server/lock`，TCP 探活跳过失效项）发现地址、读取访问凭据
 3. 内置静态服务（127.0.0.1:51821，避开官方 daemon 的 58627+ 端口段）托管官方 web 包（release 编译期内嵌进 exe，单文件分发；开发时从 web-dist 磁盘读取），通过官方支持的 `kimi_origin` 参数和 URL hash 交接 daemon 地址与凭据；稳定 origin 保留界面偏好，内容哈希资源使用长期缓存，包缺失时回退 daemon 内嵌官方 UI
-4. 状态栏是壳自有页面，直连 daemon REST/WebSocket；注入脚本只补桌面能力（通知、拖拽等）；更新提示带版本说明（Release notes 由 CI 自动生成）
+4. 状态栏是壳自有页面，直连 daemon REST（上下文用量、套餐额度、Remote Control 状态）；注入脚本只补桌面能力（通知、拖拽、会话路由上报等）；更新提示带版本说明（Release notes 由 CI 自动生成）
 
 ## 与上游的关系
 
-- Web UI 直接取自官方 `@moonshot-ai/kimi-code@0.39.0` 的 `apps/kimi-code/dist-web`
+- Web UI 直接取自官方 `@moonshot-ai/kimi-code@0.39.1` 的 `apps/kimi-code/dist-web`
 - 旧 `liujunGH/kimi-code` 的 `kimi-ui` 分支仅作为历史备份，不再 rebase 或发版
 - 界面与协议问题提交 Kimi Code 上游；本仓只维护桌面窗口、原生桥接、状态栏和打包
 

@@ -13,6 +13,8 @@
     "allow-open-url",
     "allow-notify",
     "allow-focus-window",
-    "allow-toggle-maximize"
+    "allow-toggle-maximize",
+    "allow-set-active-session",
+    "allow-remote-control"
   ]
 }

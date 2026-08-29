@@ -22,6 +22,8 @@ fn main() {
             "toggle_devtools",
             "update_info",
             "open_url",
+            "set_active_session",
+            "remote_control",
         ]),
     ))
     .expect("failed to run tauri-build");

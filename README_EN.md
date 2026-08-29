@@ -8,7 +8,10 @@ A desktop client for [Kimi Code](https://www.kimi.com/code/): **official daemon 
 
 - **Real app form**: own window, Dock icon, Cmd-Tab, close-to-quit; hidden-inset title bar with drag regions and double-click zoom
 - **Official Web UI**: consumes the prebuilt bundle from the pinned Kimi Code release, keeping UI features and protocol behavior aligned with upstream
-- **Shell-owned status bar**: a trusted local WebView for context usage, plan quota (5h/weekly), busy state, live swarm roster, follow/freeze, and updates
+- **Native menu bar**: app/file/edit/sessions/window/help menus with ⌘N new session; the Sessions menu lists recent sessions dynamically, click to jump
+- **Session-aware window title**: the title follows the current session, readable in Cmd-Tab and Mission Control
+- **Shell-owned status bar**: a trusted local WebView for context usage, plan quota (5h/weekly), busy state, follow/freeze, and updates
+- **Remote Control wrapper** (official experimental feature): one click starts `kimi rc` and shows the access link + QR code to continue local sessions from a phone or another computer
 - **Native notifications + Dock badge**: completion/question/approval alerts as macOS notifications, unread count on the Dock icon
 - **Downloads & external links**: exports land in `~/Downloads` de-duplicated; links open in the system browser
 - **Self-healing + three-layer watchdog**: loud warnings (never silent breakage) when official updates drift the DOM, protocol, or scrape format
@@ -27,7 +30,7 @@ Requires this repo plus a `kimi-code` checkout pinned to the official release ta
 
 ```bash
 git clone https://github.com/liujunGH/kimi-ui.git
-git clone --branch '@moonshot-ai/kimi-code@0.39.0' --depth 1 https://github.com/MoonshotAI/kimi-code.git
+git clone --branch '@moonshot-ai/kimi-code@0.39.1' --depth 1 https://github.com/MoonshotAI/kimi-code.git
 
 cd kimi-ui
 KIMI_CODE_REPO=../kimi-code bash scripts/build-web.sh  # stage official dist-web
@@ -38,14 +41,14 @@ Requires a Rust toolchain; Node/pnpm is no longer needed. Set `KIMI_CODE_REPO` w
 
 ## How it works
 
-1. Requires Kimi Code CLI 0.39 or newer, attaching to a live server or launching `kimi web --no-open` on an explicitly selected free port; a running daemon older than the installed CLI is skipped and gracefully shut down so an upgrade takes effect on the next launch
+1. Requires Kimi Code CLI 0.39.1 or newer, attaching to a live server or launching `kimi web --no-open` on an explicitly selected free port; a running daemon older than the installed CLI is skipped and gracefully shut down so an upgrade takes effect on the next launch
 2. Reads the daemon's address and credential from kimi's local data directory
 3. Serves the official web bundle on a stable shell-owned origin (127.0.0.1:51821, outside Kimi's 58627+ daemon range), handing over the daemon via the official `kimi_origin` parameter and the credential via the URL hash; the stable origin preserves UI preferences, content-hashed assets use long-lived caching, and a missing bundle falls back to the daemon-hosted UI
-4. The status bar is the shell's own page talking to the daemon over REST/WebSocket; the injected script only adds desktop behaviors (notifications, dragging, etc.)
+4. The status bar is the shell's own page talking to the daemon over REST (context usage, plan quota, Remote Control state); the injected script only adds desktop behaviors (notifications, dragging, session-route reporting, etc.)
 
 ## Relationship with upstream
 
-- The Web UI comes directly from `apps/kimi-code/dist-web` at official tag `@moonshot-ai/kimi-code@0.39.0`
+- The Web UI comes directly from `apps/kimi-code/dist-web` at official tag `@moonshot-ai/kimi-code@0.39.1`
 - The old `liujunGH/kimi-code` branch `kimi-ui` remains only as a historical backup; it is no longer rebased or released
 - UI and protocol issues go upstream; this repo maintains only the desktop window, native bridge, status bar, and packaging
 

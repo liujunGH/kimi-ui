@@ -1,6 +1,6 @@
 [package]
 name = "kimi-ui"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 description = "Tauri desktop shell for the official Kimi Code web UI"
 
@@ -12,6 +12,8 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # Release builds embed web-dist/ into the exe (single-file distribution).
 include_dir = "0.7"
+# Remote Control QR (rc-qrcode.png) -> data URL for the status card.
+base64 = "0.22"
 tauri-plugin-notification = "2"
 tauri-plugin-window-state = "2"
 

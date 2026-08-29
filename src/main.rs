@@ -30,10 +30,10 @@
 //!     of the window's bottom edge — it never resizes afterwards;
 //!   - a transparent, shell-owned "status" webview sits in that strip. On
 //!     demand it grows upward *over* the main webview (the main webview
-//!     does NOT move) to float a card: context-usage detail or the 蜂群
-//!     (swarm) roster. It talks to the daemon directly (REST + its own
-//!     WebSocket), so it has ZERO DOM coupling to the SPA and is the
-//!     shell's extensible UI surface.
+//!     does NOT move) to float a card: context-usage detail, the update
+//!     notice, or the Remote Control panel. It talks to the daemon directly
+//!     over REST, so it has ZERO DOM coupling to the SPA and is the shell's
+//!     extensible UI surface.
 //!
 //! Desktop integrations in the main webview (injected script):
 //!   - `window.Notification` polyfill -> native notifications, bumping the
@@ -44,9 +44,17 @@
 //!   - hidden-inset title bar: SPA drag areas mirrored to Tauri's
 //!     `data-tauri-drag-region`; double-click toggles zoom; the "internal
 //!     testing" badge is hidden;
+//!   - the SPA's route is reported to the shell, which titles the window
+//!     ("<session> — Kimi Code", visible in Cmd-Tab) and feeds the 会话
+//!     menu's recent-session list;
 //!   - streaming thinking blocks height-capped (no more chat climbing);
 //!   - double-digit ordered-list numbers unclipped;
 //!   - watchdog warns once if the SPA's desktop classes vanish.
+//!
+//! Native chrome: a Chinese-labeled menu bar (app/file/edit/sessions/window/
+//! help) installed via `app.set_menu`; Remote Control (official experimental
+//! `kimi rc`) is spawned/terminated by the `remote_control` command and its
+//! access URL + QR are shown in the status bar's remote card.
 //!
 //! NOTE: the main page is a *remote* origin to Tauri, so `capabilities/`
 //! must list the daemon URL under `remote.urls` — otherwise every IPC
@@ -62,7 +70,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Mutex,
     },
     thread,
@@ -84,8 +92,9 @@ const CUSTOM_UI_PORT: u16 = 51821;
 
 /// Unread-notification count shown on the Dock icon (macOS).
 static BADGE_COUNT: AtomicU32 = AtomicU32::new(0);
-/// Which overlay card is open: 0 = none, 1 = usage detail, 2 = swarm roster.
-static OVERLAY_MODE: AtomicU8 = AtomicU8::new(0);
+/// Whether any overlay card is open (usage / update / remote) — the status
+/// webview then grows to OVERLAY_H over the main webview.
+static OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// Daemon connection details shared with the status webview.
 #[derive(Clone)]
@@ -209,7 +218,30 @@ const INIT_SCRIPT: &str = r#"
     invoke('toggle_maximize', {});
   }, true);
 
-  // 5. Watchdog: verify each selector group this shell depends on. If an
+  // 5. Report the SPA's active session so the shell can title the window.
+  //    The official SPA is a pathname router: "/" = new session,
+  //    "/sessions/<id>" = that session. Pure URL coupling, no DOM walk.
+  var activeSession;
+  function reportRoute() {
+    var m = location.pathname.match(/^\/sessions\/([^\/]+)/);
+    var id = m ? decodeURIComponent(m[1]) : null;
+    if (id !== activeSession) {
+      activeSession = id;
+      invoke('set_active_session', { id: id });
+    }
+  }
+  ['pushState', 'replaceState'].forEach(function (fn) {
+    var orig = history[fn].bind(history);
+    history[fn] = function () {
+      var r = orig.apply(null, arguments);
+      reportRoute();
+      return r;
+    };
+  });
+  window.addEventListener('popstate', reportRoute);
+  reportRoute();
+
+  // 6. Watchdog: verify each selector group this shell depends on. If an
   //    official UI update breaks one, warn once with the broken features.
   if (isDesktop) {
     var domWarned = false;
@@ -343,7 +375,7 @@ fn no_console(cmd: Command) -> Command {
 }
 
 /// Oldest kimi CLI paired with the official web bundle shipped by this build.
-const MIN_KIMI_VERSION: &str = "0.39.0";
+const MIN_KIMI_VERSION: &str = "0.39.1";
 
 /// Structured boot failure; the placeholder page renders it as guided steps.
 #[derive(Clone, serde::Serialize)]
@@ -948,15 +980,13 @@ fn daemon_info(state: tauri::State<'_, SharedDaemon>) -> Result<Value, String> {
     Ok(serde_json::json!({ "base": s.base, "token": s.token }))
 }
 
-/// Open/close an overlay card in the status webview ("none" | "usage" | "swarm").
+/// Open/close an overlay card in the status webview ("none" collapses;
+/// "usage" | "update" | "remote" all expand to OVERLAY_H — the card layout
+/// itself lives entirely in the status page).
 #[tauri::command]
 fn set_overlay(app: tauri::AppHandle, mode: String) {
-    let mode = match mode.as_str() {
-        "usage" => 1u8,
-        "swarm" => 2u8,
-        _ => 0u8,
-    };
-    OVERLAY_MODE.store(mode, Ordering::Relaxed);
+    let open = !matches!(mode.as_str(), "none" | "");
+    OVERLAY_OPEN.store(open, Ordering::Relaxed);
     layout_strip(&app);
 }
 
@@ -971,7 +1001,7 @@ fn layout_strip(app: &tauri::AppHandle) {
     let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) else { return };
     let w = size.width as f64 / scale;
     let h = size.height as f64 / scale;
-    let overlay = OVERLAY_MODE.load(Ordering::Relaxed) != 0;
+    let overlay = OVERLAY_OPEN.load(Ordering::Relaxed);
     let status_h = if overlay { OVERLAY_H } else { STRIP };
     let _ = main_wv.set_size(LogicalSize::new(w, (h - STRIP).max(240.0)));
     let _ = status_wv.set_position(LogicalPosition::new(0.0, h - status_h));
@@ -1064,6 +1094,294 @@ fn open_url(url: String) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Active session & window title.
+//
+// The injected script reports the SPA's route (`/sessions/<id>` or the
+// new-session root) via `set_active_session`. A 30s refresher keeps an ordered
+// (id, title) list from `GET /api/v1/sessions` which feeds both the window
+// title — visible in Cmd-Tab / Mission Control even though the title bar text
+// itself is hidden — and the dynamic 会话 (recent sessions) menu.
+// ---------------------------------------------------------------------------
+
+/// Session the SPA is currently viewing, from its URL route.
+static ACTIVE_SESSION: Mutex<Option<String>> = Mutex::new(None);
+/// Ordered (id, title) pairs of recent non-archived sessions (API order).
+static SESSION_TITLES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// How many recent sessions the 会话 menu shows.
+const MENU_SESSIONS: usize = 8;
+
+fn daemon_state(app: &tauri::AppHandle) -> Option<DaemonState> {
+    app.try_state::<SharedDaemon>()
+        .and_then(|s| s.lock().ok().and_then(|g| g.clone()))
+}
+
+/// Recent non-archived sessions as ordered (id, title) pairs.
+fn fetch_sessions(daemon: &DaemonState) -> Result<Vec<(String, String)>, String> {
+    let v = http_get_json(&daemon.base, "/api/v1/sessions?page_size=50", &daemon.token)?;
+    parse_sessions(&v).ok_or_else(|| "会话列表结构可能已变化".to_string())
+}
+
+/// `(id, title)` pairs from a `GET /api/v1/sessions` payload; None when the
+/// envelope shape drifted.
+fn parse_sessions(v: &Value) -> Option<Vec<(String, String)>> {
+    let items = v["data"]["items"].as_array()?;
+    Some(
+        items
+            .iter()
+            .filter(|s| !s["archived"].as_bool().unwrap_or(false))
+            .filter_map(|s| {
+                let id = s["id"].as_str()?.to_string();
+                let title = s["title"]
+                    .as_str()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or("未命名会话");
+                Some((id, title.to_string()))
+            })
+            .collect(),
+    )
+}
+
+/// Truncate on char boundaries so CJK titles never panic mid-codepoint.
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// "<session title> — Kimi Code", or the plain app name without one.
+fn window_title_text() -> String {
+    let Some(id) = ACTIVE_SESSION.lock().ok().and_then(|g| g.clone()) else {
+        return "Kimi Code".to_string();
+    };
+    SESSION_TITLES
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.iter()
+                .find(|(sid, _)| *sid == id)
+                .map(|(_, title)| format!("{} — Kimi Code", truncate_chars(title, 60)))
+        })
+        .unwrap_or_else(|| "Kimi Code".to_string())
+}
+
+fn refresh_window_title(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_window("main") {
+        let title = window_title_text();
+        let _ = window.set_title(&title);
+    }
+}
+
+/// Fetch the session list once, then update the title and menu. Cheap
+/// loopback call, so running it on every route change is fine.
+fn sync_sessions_and_title(app: &tauri::AppHandle) {
+    if let Some(daemon) = daemon_state(app) {
+        if let Ok(sessions) = fetch_sessions(&daemon) {
+            if let Ok(mut guard) = SESSION_TITLES.lock() {
+                *guard = sessions;
+            }
+        }
+    }
+    refresh_window_title(app);
+    refresh_sessions_menu(app);
+}
+
+/// Called by the injected script whenever the SPA's route changes.
+#[tauri::command]
+fn set_active_session(app: tauri::AppHandle, id: Option<String>) {
+    if let Ok(mut guard) = ACTIVE_SESSION.lock() {
+        *guard = id;
+    }
+    let app = app.clone();
+    thread::spawn(move || sync_sessions_and_title(&app));
+}
+
+fn start_sessions_refresher(app: tauri::AppHandle) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(30));
+        sync_sessions_and_title(&app);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Native menu bar.
+//
+// macOS top level must be submenus only. The 会话 submenu is rebuilt
+// wholesale (app.set_menu) whenever the recent-session list changes — menu
+// types are not storable off the main thread, and full rebuilds are rare
+// because they are skipped when the list did not change.
+// ---------------------------------------------------------------------------
+
+/// Last session list the menu was built from; skip rebuilds when unchanged.
+static MENU_BUILT: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+fn build_app_menu(
+    app: &tauri::AppHandle,
+    sessions: &[(String, String)],
+) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    let app_menu = Submenu::with_items(app, "Kimi Code", true, &[
+        &PredefinedMenuItem::about(app, Some("关于 Kimi Code"), None)?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::services(app, Some("服务"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::hide(app, Some("隐藏 Kimi Code"))?,
+        &PredefinedMenuItem::hide_others(app, Some("隐藏其他"))?,
+        &PredefinedMenuItem::show_all(app, Some("显示全部"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::quit(app, Some("退出 Kimi Code"))?,
+    ])?;
+
+    let file_menu = Submenu::with_items(app, "文件", true, &[
+        &MenuItem::with_id(app, "new-session", "新建会话", true, Some("CmdOrCtrl+N"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::close_window(app, Some("关闭窗口"))?,
+    ])?;
+
+    let edit_menu = Submenu::with_items(app, "编辑", true, &[
+        &PredefinedMenuItem::undo(app, Some("撤销"))?,
+        &PredefinedMenuItem::redo(app, Some("重做"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::cut(app, Some("剪切"))?,
+        &PredefinedMenuItem::copy(app, Some("复制"))?,
+        &PredefinedMenuItem::paste(app, Some("粘贴"))?,
+        &PredefinedMenuItem::select_all(app, Some("全选"))?,
+    ])?;
+
+    let sessions_menu = Submenu::new(app, "会话", true)?;
+    let recents: Vec<MenuItem<tauri::Wry>> = sessions
+        .iter()
+        .take(MENU_SESSIONS)
+        .map(|(id, title)| {
+            MenuItem::with_id(
+                app,
+                format!("open-session:{id}"),
+                truncate_chars(title, 40),
+                true,
+                None::<&str>,
+            )
+        })
+        .collect::<tauri::Result<_>>()?;
+    if recents.is_empty() {
+        let empty = MenuItem::with_id(app, "sessions-empty", "（暂无会话）", false, None::<&str>)?;
+        sessions_menu.append(&empty)?;
+    } else {
+        let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+            recents.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<tauri::Wry>).collect();
+        sessions_menu.append_items(&refs)?;
+    }
+
+    let window_menu = Submenu::with_items(app, "窗口", true, &[
+        &PredefinedMenuItem::minimize(app, Some("最小化"))?,
+        &MenuItem::with_id(app, "zoom", "缩放", true, None::<&str>)?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::bring_all_to_front(app, Some("全部置前"))?,
+    ])?;
+
+    let help_menu = Submenu::with_items(app, "帮助", true, &[
+        &MenuItem::with_id(app, "docs", "官方文档", true, None::<&str>)?,
+        &MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?,
+    ])?;
+
+    let menu = Menu::with_items(app, &[
+        &app_menu,
+        &file_menu,
+        &edit_menu,
+        &sessions_menu,
+        &window_menu,
+        &help_menu,
+    ])?;
+    app.set_menu(menu)?;
+    Ok(())
+}
+
+/// Rebuild the menu when the recent-sessions list changed. Runs the build on
+/// the main thread — NSApplication's main menu must only be touched there.
+fn refresh_sessions_menu(app: &tauri::AppHandle) {
+    let sessions: Vec<(String, String)> = SESSION_TITLES
+        .lock()
+        .map(|g| {
+            g.iter()
+                .take(MENU_SESSIONS)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let unchanged = MENU_BUILT
+        .lock()
+        .map(|built| *built == sessions)
+        .unwrap_or(false);
+    if unchanged {
+        return;
+    }
+    if let Ok(mut built) = MENU_BUILT.lock() {
+        *built = sessions.clone();
+    }
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Err(e) = build_app_menu(&app2, &sessions) {
+            eprintln!("kimi-ui: 重建菜单失败：{e}");
+        }
+    });
+}
+
+/// In-page SPA navigation: calling the SPA's own wrapped history.pushState
+/// (our document-start wrapper sits beneath it) makes the router react
+/// without a reload; the catch fallback covers a not-yet-booted page.
+fn eval_main_navigation(app: &tauri::AppHandle, path: &str) {
+    if let Some(wv) = app.get_webview("main") {
+        let path_json = serde_json::json!(path).to_string();
+        let _ = wv.eval(&format!(
+            "try{{history.pushState({{}},'',{path_json})}}catch(e){{location.assign({path_json})}}"
+        ));
+    }
+}
+
+/// Menu-bar actions. Registered once in setup; `event.id()` is the
+/// MenuItem id we assigned (or "open-session:<id>").
+fn handle_menu_event(app: &tauri::AppHandle, event: &tauri::menu::MenuEvent) {
+    let id = event.id().0.as_str();
+    match id {
+        "new-session" => {
+            let _ = app.get_window("main").map(|w| w.set_focus());
+            eval_main_navigation(app, "/");
+        }
+        "zoom" => {
+            if let Some(window) = app.get_window("main") {
+                let _ = (|| -> tauri::Result<()> {
+                    if window.is_maximized()? {
+                        window.unmaximize()
+                    } else {
+                        window.maximize()
+                    }
+                })();
+            }
+        }
+        "docs" => open_in_system_browser(&"https://www.kimi.com/code/docs/en/".parse().unwrap()),
+        "check-update" => {
+            let url = UPDATE_INFO
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|i| i.url.clone()))
+                .unwrap_or_else(|| "https://github.com/liujunGH/kimi-ui/releases/latest".into());
+            if let Ok(u) = url.parse::<Url>() {
+                open_in_system_browser(&u);
+            }
+        }
+        _ if id.starts_with("open-session:") => {
+            let sid = &id["open-session:".len()..];
+            let _ = app.get_window("main").map(|w| w.set_focus());
+            let path_json = serde_json::json!(format!("/sessions/{sid}")).to_string();
+            if let Some(wv) = app.get_webview("main") {
+                let _ = wv.eval(&format!(
+                    "try{{history.pushState({{}},'',{path_json})}}catch(e){{location.assign({path_json})}}"
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -1079,7 +1397,9 @@ fn main() {
             set_scroll_freeze,
             toggle_devtools,
             update_info,
-            open_url
+            open_url,
+            set_active_session,
+            remote_control
         ])
         .setup(|app| {
             let window_builder = WindowBuilder::new(app, "main")
@@ -1118,10 +1438,22 @@ fn main() {
                     tauri::WindowEvent::Focused(true) => {
                         BADGE_COUNT.store(0, Ordering::Relaxed);
                         set_dock_badge(&app_handle, 0);
+                        // Titles move fast while chatting; refresh on focus.
+                        let app2 = app_handle.clone();
+                        thread::spawn(move || sync_sessions_and_title(&app2));
                     }
                     _ => {}
                 });
             }
+
+            // Native menu bar + its actions. Built once now (empty 会话
+            // list), rebuilt on the main thread whenever recents change.
+            if let Err(e) = build_app_menu(app.handle(), &[]) {
+                eprintln!("kimi-ui: 构建菜单失败：{e}");
+            }
+            let app_handle = app.handle().clone();
+            app.on_menu_event(move |handle, event| handle_menu_event(handle, &event));
+            start_sessions_refresher(app_handle);
 
             let app_handle = app.handle().clone();
             thread::spawn(move || match connect_daemon() {
@@ -1150,14 +1482,22 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building kimi-ui")
         .run(|_app, event| {
-            // Kill the `kimi web` child we spawned (if any) so it does not
-            // outlive the shell — mirrors the old daemon's idle exit.
+            // Reap the children we spawned (daemon, `kimi rc`) so neither
+            // outlives the shell.
             if let tauri::RunEvent::Exit = event {
                 if let Ok(mut guard) = SPAWNED_SERVER.lock() {
                     if let Some(mut child) = guard.take() {
                         let _ = child.kill();
                         let _ = child.wait();
                     }
+                }
+                if let Some(mut child) = REMOTE_RC.lock().ok().and_then(|mut g| g.take()) {
+                    if let Some(lock) = read_rc_lock() {
+                        terminate_pid(lock.pid);
+                    } else {
+                        terminate_pid(child.id());
+                    }
+                    let _ = child.wait();
                 }
             }
         });
@@ -1314,6 +1654,254 @@ fn plan_usage(state: tauri::State<'_, SharedDaemon>) -> Value {
     match guard.as_ref().and_then(|g| g.as_ref()) {
         Some(u) => serde_json::to_value(u).unwrap_or_else(|_| Value::Null),
         None => serde_json::json!({ "loading": true }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote Control (official experimental `kimi rc`).
+//
+// `kimi rc` runs its own foreground server plus a reverse-tunnel client to
+// code-rc.kimi.com; the access URL goes to stdout and the single-instance
+// lock at <home>/server/rc.json carries {pid, local_origin, url}. The shell
+// starts/stops that child, reads the lock for status (TCP-probing
+// local_origin instead of trusting the pid — same liveness model as daemon
+// discovery), and surfaces the QR code the CLI drops at <home>/rc-qrcode.png.
+// ---------------------------------------------------------------------------
+
+/// The `kimi rc` child we spawned (None when started outside the shell).
+static REMOTE_RC: Mutex<Option<Child>> = Mutex::new(None);
+static RC_STARTING: AtomicBool = AtomicBool::new(false);
+/// Tail of the child's stderr, surfaced when it dies unexpectedly.
+static RC_STDERR: Mutex<String> = Mutex::new(String::new());
+
+/// Status payload for the status page's remote card.
+#[derive(Clone, Default, serde::Serialize)]
+struct RcState {
+    running: bool,
+    starting: bool,
+    url: String,
+    error: String,
+    /// rc-qrcode.png as a data-URL body (empty when unavailable).
+    qr_base64: String,
+}
+
+fn rc_lock_path() -> PathBuf {
+    kimi_home().join("server/rc.json")
+}
+
+/// Parsed rc.json: the fields the shell cares about.
+struct RcLock {
+    pid: u32,
+    local_origin: String,
+    url: String,
+}
+
+fn read_rc_lock() -> Option<RcLock> {
+    let raw = fs::read_to_string(rc_lock_path()).ok()?;
+    parse_rc_lock(&raw)
+}
+
+/// Fields the shell cares about from rc.json.
+fn parse_rc_lock(raw: &str) -> Option<RcLock> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    Some(RcLock {
+        pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok())?,
+        local_origin: v["local_origin"].as_str().unwrap_or("").to_string(),
+        url: v["url"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// The lock counts as live when its recorded local server still accepts
+/// connections — immune to pid reuse, same model as daemon discovery.
+fn rc_lock_alive(lock: &RcLock) -> bool {
+    let origin = lock.local_origin.trim_start_matches("http://");
+    match origin.split_once(':') {
+        Some((host, port)) => port
+            .parse::<u16>()
+            .map(|p| tcp_alive(host, p))
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+fn rc_qrcode_base64() -> String {
+    use base64::Engine as _;
+    fs::read(kimi_home().join("rc-qrcode.png"))
+        .ok()
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+        .unwrap_or_default()
+}
+
+fn rc_state() -> RcState {
+    let starting = RC_STARTING.load(Ordering::Relaxed);
+    if let Some(lock) = read_rc_lock() {
+        if rc_lock_alive(&lock) {
+            return RcState {
+                running: true,
+                starting,
+                url: lock.url,
+                error: String::new(),
+                qr_base64: rc_qrcode_base64(),
+            };
+        }
+    }
+    if let Ok(mut guard) = REMOTE_RC.lock() {
+        if let Some(child) = guard.as_mut() {
+            if let Ok(Some(_)) = child.try_wait() {
+                // Our child died without leaving a live lock — surface stderr.
+                let tail = RC_STDERR.lock().map(|s| truncate_chars(&s, 300)).unwrap_or_default();
+                return RcState {
+                    running: false,
+                    starting: false,
+                    url: String::new(),
+                    error: format!("`kimi rc` 已退出：{}", tail.trim()),
+                    qr_base64: String::new(),
+                };
+            }
+        }
+    }
+    RcState {
+        running: false,
+        starting,
+        ..RcState::default()
+    }
+}
+
+/// SIGTERM the RC child so the CLI's own shutdown runs (relay disconnect,
+/// lock release). `kill`/`taskkill` via Command keeps us off libc.
+fn terminate_pid(pid: u32) {
+    #[cfg(unix)]
+    let _ = no_console(Command::new("kill")).arg(pid.to_string()).spawn();
+    #[cfg(windows)]
+    let _ = no_console(Command::new("taskkill"))
+        .args(["/PID", &pid.to_string()])
+        .spawn();
+}
+
+fn rc_start(app: &tauri::AppHandle) {
+    if RC_STARTING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let app = app.clone();
+    thread::spawn(move || {
+        if let Err(e) = rc_start_blocking(&app) {
+            eprintln!("kimi-ui: Remote Control 启动失败：{e}");
+            if let Ok(mut guard) = RC_STDERR.lock() {
+                *guard = e.clone();
+            }
+        }
+        RC_STARTING.store(false, Ordering::Relaxed);
+    });
+}
+
+fn rc_start_blocking(app: &tauri::AppHandle) -> Result<(), String> {
+    if rc_state().running {
+        return Ok(());
+    }
+    let kimi = find_kimi().ok_or("找不到 kimi CLI")?;
+    let mut cmd = no_console(Command::new(&kimi));
+    cmd.arg("rc")
+        .env("KIMI_CODE_EXPERIMENTAL_REMOTE_CONTROL", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("拉起 `kimi rc` 失败：{e}"))?;
+
+    // Drain both pipes so the child never blocks on a full buffer; keep a
+    // stderr tail for failure reporting.
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let mut reader = BufReader::new(stderr);
+            let mut buf = String::new();
+            let mut total = String::new();
+            loop {
+                buf.clear();
+                match reader.read_line(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        total.push_str(&buf);
+                        if let Ok(mut guard) = RC_STDERR.lock() {
+                            *guard = truncate_chars(&total, 2000);
+                        }
+                    }
+                }
+            }
+        });
+    }
+    if let Some(mut stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut sink);
+        });
+    }
+    if let Ok(mut guard) = REMOTE_RC.lock() {
+        *guard = Some(child);
+    }
+
+    // Wait for the lock (and its URL) or an early exit — the CLI needs to
+    // boot its server and register with the relay first.
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(300));
+        let state = rc_state();
+        if state.running && !state.url.is_empty() {
+            notify_rc_ready(app);
+            return Ok(());
+        }
+        if let Ok(mut guard) = REMOTE_RC.lock() {
+            if let Some(child) = guard.as_mut() {
+                if let Ok(Some(_)) = child.try_wait() {
+                    let tail = RC_STDERR
+                        .lock()
+                        .map(|s| truncate_chars(&s, 300))
+                        .unwrap_or_default();
+                    return Err(format!("`kimi rc` 提前退出：{}", tail.trim()));
+                }
+            }
+        }
+    }
+    Err("等待 Remote Control 就绪超时（需要 Kimi 账号登录）".to_string())
+}
+
+fn rc_stop() {
+    if let Some(mut child) = REMOTE_RC.lock().ok().and_then(|mut g| g.take()) {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        if let Some(lock) = read_rc_lock() {
+            terminate_pid(lock.pid);
+        } else {
+            terminate_pid(child.id());
+        }
+        let _ = child.wait();
+    } else if let Some(lock) = read_rc_lock() {
+        terminate_pid(lock.pid);
+    }
+}
+
+/// Native notification once the tunnel is ready (the card may be closed).
+fn notify_rc_ready(app: &tauri::AppHandle) {
+    let _ = app
+        .notification()
+        .builder()
+        .title("Kimi Remote Control")
+        .body("远程访问已就绪，点击状态栏“远程”查看链接")
+        .show();
+}
+
+/// Status-bar entry point: "start" | "stop" | "status".
+#[tauri::command]
+fn remote_control(app: tauri::AppHandle, action: String) -> Value {
+    match action.as_str() {
+        "start" => {
+            rc_start(&app);
+            serde_json::json!({})
+        }
+        "stop" => {
+            rc_stop();
+            serde_json::json!({})
+        }
+        _ => serde_json::to_value(rc_state()).unwrap_or(Value::Null),
     }
 }
 
@@ -1625,9 +2213,9 @@ mod tests {
 
     #[test]
     fn enforces_minimum_kimi_version() {
-        assert!(version_older("0.38.9", MIN_KIMI_VERSION));
-        assert!(!version_older("0.39.0", MIN_KIMI_VERSION));
+        assert!(version_older("0.39.0", MIN_KIMI_VERSION));
         assert!(!version_older("0.39.1", MIN_KIMI_VERSION));
+        assert!(!version_older("0.39.2", MIN_KIMI_VERSION));
         assert!(!version_older("1.0.0", MIN_KIMI_VERSION));
     }
 
@@ -1728,5 +2316,71 @@ mod tests {
         });
         let err = http_get_json(&format!("http://127.0.0.1:{port}"), "/", "x").unwrap_err();
         assert!(err.contains("401"), "{err}");
+    }
+
+    #[test]
+    fn parses_sessions_for_title_and_menu() {
+        let v: Value = serde_json::from_str(
+            r#"{"data":{"items":[
+                {"id":"s1","title":"修复登录","busy":false,"archived":false},
+                {"id":"s2","title":"","busy":false,"archived":false},
+                {"id":"s3","title":"旧会话","busy":false,"archived":true}
+            ]}}"#,
+        )
+        .unwrap();
+        let sessions = parse_sessions(&v).unwrap();
+        assert_eq!(
+            sessions,
+            vec![
+                ("s1".to_string(), "修复登录".to_string()),
+                ("s2".to_string(), "未命名会话".to_string()),
+            ]
+        );
+        assert!(parse_sessions(&serde_json::json!({ "data": {} })).is_none());
+    }
+
+    #[test]
+    fn truncates_on_char_boundaries() {
+        assert_eq!(truncate_chars("abcde", 3), "abc");
+        assert_eq!(truncate_chars("会话标题很长", 4), "会话标题");
+        assert_eq!(truncate_chars("短", 10), "短");
+        assert_eq!(truncate_chars("", 10), "");
+    }
+
+    #[test]
+    fn parses_rc_lock_fields() {
+        let lock = parse_rc_lock(
+            r#"{"pid":4321,"nonce":"x","local_origin":"http://127.0.0.1:58627",
+                "device_id":"d","url":"https://code-rc.kimi.com/devices/d/?rc=1",
+                "started_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(lock.pid, 4321);
+        assert_eq!(lock.local_origin, "http://127.0.0.1:58627");
+        assert_eq!(lock.url, "https://code-rc.kimi.com/devices/d/?rc=1");
+        assert!(parse_rc_lock(r#"{"pid":"not-a-number"}"#).is_none());
+        assert!(parse_rc_lock("not json").is_none());
+    }
+
+    #[test]
+    fn rc_lock_liveness_probes_recorded_origin() {
+        let (_listener, port) = live_port();
+        let live = RcLock {
+            pid: 1,
+            local_origin: format!("http://127.0.0.1:{port}"),
+            url: String::new(),
+        };
+        assert!(rc_lock_alive(&live));
+        let dead = RcLock {
+            pid: 1,
+            local_origin: format!("http://127.0.0.1:{}", dead_port()),
+            url: String::new(),
+        };
+        assert!(!rc_lock_alive(&dead));
+        assert!(!rc_lock_alive(&RcLock {
+            pid: 1,
+            local_origin: String::new(),
+            url: String::new(),
+        }));
     }
 }
