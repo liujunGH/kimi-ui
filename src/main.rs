@@ -1009,9 +1009,17 @@ fn layout_strip(app: &tauri::AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
-// Update check: compares the latest GitHub release tag with CARGO_PKG_VERSION.
-// Uses the gh CLI (carries the user's GitHub auth — the repo is private) and
-// falls back to the anonymous API once the repo is public.
+// Update check + in-app auto-update (macOS).
+//
+// The repo is public: checks prefer `gh` (auth, avoids API rate limits) and
+// fall back to anonymous curl. Downloads are anonymous curl from the release
+// CDN, verified against the asset's sha256 digest from the same API
+// response. The installer swaps the RUNNING app bundle in place with
+// same-volume renames and relaunches via a detached helper. Windows keeps
+// the badge -> browser flow (a running exe cannot replace itself).
+//
+// Test hooks: KIMI_UI_FORCE_UPDATE=1 always reports has_update;
+// KIMI_UI_UPDATE_TAG=<tag> targets a specific release instead of latest.
 // ---------------------------------------------------------------------------
 
 /// Latest-release info exposed to the status page.
@@ -1022,6 +1030,13 @@ struct UpdateInfo {
     has_update: bool,
     /// Release notes (markdown), rendered by the status page's update card.
     notes: String,
+    /// macOS zip asset for auto-update (empty when absent).
+    asset_url: String,
+    asset_size: u64,
+    /// "sha256:<hex>" from the release API (empty when absent).
+    asset_digest: String,
+    /// Auto-update only exists on macOS.
+    can_auto_update: bool,
 }
 
 static UPDATE_INFO: Mutex<Option<UpdateInfo>> = Mutex::new(None);
@@ -1052,23 +1067,58 @@ fn version_newer(latest: &str, current: &str) -> bool {
     parts(latest) > parts(current)
 }
 
-fn fetch_latest_release() -> Option<UpdateInfo> {
-    let gh = find_executable("gh")?;
-    let out = no_console(Command::new(gh))
-        .args(["api", "repos/liujunGH/kimi-ui/releases/latest"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let json: Value = serde_json::from_slice(&out.stdout).ok()?;
+/// The macOS release asset this updater downloads.
+const MACOS_ASSET: &str = "kimi-ui-macos-arm64.zip";
+
+/// `UpdateInfo` from a releases API JSON body; None when the shape drifted.
+fn parse_release_json(raw: &str) -> Option<UpdateInfo> {
+    let json: Value = serde_json::from_str(raw).ok()?;
     let latest = json["tag_name"].as_str()?.trim_start_matches('v').to_string();
     let url = json["html_url"].as_str()?.to_string();
     let notes = json["body"].as_str().unwrap_or("").trim().to_string();
+    let asset = json["assets"]
+        .as_array()?
+        .iter()
+        .find(|a| a["name"].as_str() == Some(MACOS_ASSET))?;
+    let forced = std::env::var("KIMI_UI_FORCE_UPDATE").map_or(false, |v| v == "1");
     Some(UpdateInfo {
-        has_update: version_newer(&latest, env!("CARGO_PKG_VERSION")),
+        has_update: forced || version_newer(&latest, env!("CARGO_PKG_VERSION")),
         latest,
         url,
         notes,
+        asset_url: asset["browser_download_url"].as_str().unwrap_or("").to_string(),
+        asset_size: asset["size"].as_u64().unwrap_or(0),
+        asset_digest: asset["digest"].as_str().unwrap_or("").to_string(),
+        can_auto_update: cfg!(target_os = "macos"),
     })
+}
+
+/// Fetch the latest-release JSON: gh first (auth), anonymous curl fallback.
+fn fetch_latest_release() -> Option<UpdateInfo> {
+    let endpoint = match std::env::var("KIMI_UI_UPDATE_TAG") {
+        Ok(tag) if !tag.is_empty() => format!("releases/tags/{tag}"),
+        _ => "releases/latest".to_string(),
+    };
+    let api = format!("repos/liujunGH/kimi-ui/{endpoint}");
+    if let Some(gh) = find_executable("gh") {
+        if let Ok(out) = no_console(Command::new(gh)).args(["api", &api]).output() {
+            if out.status.success() {
+                if let Some(info) = parse_release_json(&String::from_utf8_lossy(&out.stdout)) {
+                    return Some(info);
+                }
+            }
+        }
+    }
+    let curl = find_executable("curl")?;
+    let url = format!("https://api.github.com/liujunGH/kimi-ui/{endpoint}");
+    let out = no_console(Command::new(curl))
+        .args(["-sL", "--fail", "--max-time", "20", &url])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_release_json(&String::from_utf8_lossy(&out.stdout))
 }
 
 fn start_update_check() {
@@ -1085,6 +1135,259 @@ fn update_info() -> Value {
     let info = UPDATE_INFO.lock().ok().and_then(|g| g.clone());
     info.map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
         .unwrap_or(Value::Null)
+}
+
+// ---------------------------------------------------------------------------
+// Auto-update pipeline: download -> verify -> stage -> swap-and-relaunch.
+// ---------------------------------------------------------------------------
+
+/// Pipeline state polled by the status page.
+#[derive(Clone, serde::Serialize)]
+struct UpdateProgress {
+    phase: &'static str, // idle | downloading | verifying | ready | error
+    pct: u32,            // 0-100 while downloading
+    message: String,
+}
+
+static UPDATE_PROGRESS: Mutex<UpdateProgress> = Mutex::new(UpdateProgress {
+    phase: "idle",
+    pct: 0,
+    message: String::new(),
+});
+static AUTO_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Extracted new app from a completed download, consumed by install.
+static STAGED_APP: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn set_progress(phase: &'static str, pct: u32, message: String) {
+    if let Ok(mut guard) = UPDATE_PROGRESS.lock() {
+        *guard = UpdateProgress { phase, pct, message };
+    }
+}
+
+/// sha256 hex digest of a file via `shasum -a 256`.
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let shasum = find_executable("shasum").ok_or("找不到 shasum")?;
+    let out = no_console(Command::new(shasum))
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("计算校验值失败：{e}"))?;
+    if !out.status.success() {
+        return Err("shasum 执行失败".to_string());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .next()
+        .map(|h| h.to_lowercase())
+        .ok_or_else(|| "shasum 输出为空".to_string())
+}
+
+/// Compare a "sha256:<hex>" API digest with a local file's digest.
+fn digest_matches(api_digest: &str, actual_hex: &str) -> bool {
+    let expected = api_digest
+        .trim()
+        .trim_start_matches("sha256:")
+        .to_lowercase();
+    !expected.is_empty() && expected == actual_hex.to_lowercase()
+}
+
+/// The app bundle currently running (…/Kimi Code.app from the exe path).
+#[cfg(target_os = "macos")]
+fn current_app_bundle() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // exe -> MacOS -> Contents -> <App>.app
+    exe.ancestors().nth(3).map(Path::to_path_buf)
+}
+
+/// Download, verify and stage the new bundle (background thread body).
+fn auto_update_pipeline() -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("自动更新目前仅支持 macOS，请前往下载".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(info) = UPDATE_INFO.lock().ok().and_then(|g| g.clone()) else {
+            return Err("尚未获取到版本信息".to_string());
+        };
+        if info.asset_url.is_empty() || info.asset_digest.is_empty() {
+            return Err("版本信息缺少下载资产".to_string());
+        }
+
+        let work = std::env::temp_dir().join(format!("kimi-ui-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).map_err(|e| format!("创建临时目录失败：{e}"))?;
+        let zip = work.join("bundle.zip");
+
+        // Download with curl; progress is derived by polling the file size.
+        set_progress("downloading", 0, String::new());
+        let curl = find_executable("curl").ok_or("找不到 curl")?;
+        let mut child = no_console(Command::new(curl))
+            .args(["-L", "--fail", "--silent", "--show-error", "-o"])
+            .arg(&zip)
+            .arg(&info.asset_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("启动 curl 失败：{e}"))?;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        let err = child
+                            .stderr
+                            .take()
+                            .and_then(|mut s| {
+                                use std::io::Read as _;
+                                let mut buf = String::new();
+                                s.read_to_string(&mut buf).ok().map(|_| buf)
+                            })
+                            .unwrap_or_default();
+                        let tail = truncate_chars(err.trim(), 200);
+                        return Err(format!("下载失败：{tail}"));
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    let done = fs::metadata(&zip).map(|m| m.len()).unwrap_or(0);
+                    let pct = if info.asset_size > 0 {
+                        ((done as f64 / info.asset_size as f64) * 100.0).min(99.0) as u32
+                    } else {
+                        0
+                    };
+                    set_progress("downloading", pct, String::new());
+                    thread::sleep(Duration::from_millis(400));
+                }
+                Err(e) => return Err(format!("等待下载失败：{e}")),
+            }
+        }
+
+        // Verify against the API digest before touching anything else.
+        set_progress("verifying", 100, "校验中…".to_string());
+        let actual = file_sha256(&zip)?;
+        if !digest_matches(&info.asset_digest, &actual) {
+            return Err("校验失败：下载内容与官方发布不一致".to_string());
+        }
+
+        // Extract and stage. ditto is the counterpart of the CI packager and
+        // preserves resource forks / permissions that plain unzip drops.
+        let ditto = find_executable("ditto").ok_or("找不到 ditto")?;
+        let out = no_console(Command::new(ditto))
+            .args(["-x", "-k"])
+            .arg(&zip)
+            .arg(&work)
+            .output()
+            .map_err(|e| format!("启动 ditto 失败：{e}"))?;
+        if !out.status.success() {
+            return Err("解包失败".to_string());
+        }
+        let new_app = work.join("Kimi Code.app");
+        if !new_app.is_dir() {
+            return Err("解包后未找到 Kimi Code.app".to_string());
+        }
+        // Defensive: curl downloads carry no quarantine bit, strip anyway so
+        // Gatekeeper never blocks the ad-hoc-signed bundle.
+        let _ = no_console(Command::new("xattr"))
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(&new_app)
+            .output();
+        if let Ok(mut guard) = STAGED_APP.lock() {
+            *guard = Some(new_app);
+        }
+        set_progress("ready", 100, format!("v{} 已就绪", info.latest));
+        Ok(())
+    }
+}
+
+/// Swap the staged bundle in place of the running app, then relaunch.
+/// Same-volume renames keep each step atomic; a failed placement rolls back.
+#[cfg(target_os = "macos")]
+fn auto_update_install_mac(app: &tauri::AppHandle) -> Result<(), String> {
+    let staged = STAGED_APP
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .ok_or("尚未下载完成".to_string())?;
+    let bundle = current_app_bundle().ok_or("无法定位当前应用位置")?;
+    let parent = bundle
+        .parent()
+        .ok_or("无法定位应用所在目录")?
+        .to_path_buf();
+    let file_name = bundle
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("应用目录名无效")?
+        .to_string();
+    let old = parent.join(format!(".{file_name}.old-{}", std::process::id()));
+
+    // 1. move the running bundle aside (the process keeps its inodes).
+    fs::rename(&bundle, &old).map_err(|e| {
+        format!("无法移动当前应用（目录可能无写权限）：{e}。可手动下载更新")
+    })?;
+    // 2. move the staged bundle in; roll back on failure.
+    if fs::rename(&staged, &bundle).is_err() {
+        let _ = fs::rename(&old, &bundle);
+        return Err("放置新版本失败，已回滚".to_string());
+    }
+    // 3. detached helper: relaunch the new app, then clean the old bundle
+    //    and the staging dir (zip + extracted copy).
+    let work_dir = staged.parent().map(Path::to_path_buf);
+    let script = "sleep 1; open \"$1\"; sleep 3; rm -rf \"$2\" \"$3\"";
+    let _ = no_console(Command::new("sh"))
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .arg(&bundle)
+        .arg(&old)
+        .arg(work_dir.unwrap_or_else(|| PathBuf::from("/dev/null")))
+        .spawn();
+    // 4. exit through the normal path so spawned children are reaped.
+    app.exit(0);
+    Ok(())
+}
+
+/// Status-bar entry point: "start" | "install" | "status".
+#[tauri::command]
+fn auto_update(app: tauri::AppHandle, action: String) -> Value {
+    match action.as_str() {
+        "start" => {
+            if !AUTO_UPDATE_RUNNING.swap(true, Ordering::Relaxed) {
+                thread::spawn(move || {
+                    if let Err(e) = auto_update_pipeline() {
+                        eprintln!("kimi-ui: 自动更新失败：{e}");
+                        set_progress("error", 0, e);
+                    }
+                    AUTO_UPDATE_RUNNING.store(false, Ordering::Relaxed);
+                });
+            }
+            serde_json::json!({})
+        }
+        "install" => {
+            #[cfg(target_os = "macos")]
+            {
+                match auto_update_install_mac(&app) {
+                    Ok(()) => serde_json::json!({ "ok": true }),
+                    Err(e) => {
+                        set_progress("error", 0, e.clone());
+                        serde_json::json!({ "ok": false, "error": e })
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                serde_json::json!({ "ok": false, "error": "自动更新目前仅支持 macOS".to_string() })
+            }
+        }
+        _ => {
+            let snapshot = UPDATE_PROGRESS.lock().map(|g| g.clone()).unwrap_or(UpdateProgress {
+                phase: "idle",
+                pct: 0,
+                message: String::new(),
+            });
+            serde_json::to_value(snapshot).unwrap_or(Value::Null)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1399,7 +1702,8 @@ fn main() {
             update_info,
             open_url,
             set_active_session,
-            remote_control
+            remote_control,
+            auto_update
         ])
         .setup(|app| {
             let window_builder = WindowBuilder::new(app, "main")
@@ -2382,5 +2686,42 @@ mod tests {
             local_origin: String::new(),
             url: String::new(),
         }));
+    }
+
+    #[test]
+    fn digests_match_with_prefix_and_case() {
+        let hex = "7960187B8E9FD9505368CF7830E8C6A84A1FAFCAFFD4CB9998344EC6BA896AE4";
+        assert!(digest_matches(&format!("sha256:{hex}"), &hex.to_lowercase()));
+        assert!(digest_matches(hex, &hex.to_lowercase()));
+        assert!(!digest_matches("sha256:deadbeef", &hex.to_lowercase()));
+        assert!(!digest_matches("", &hex.to_lowercase())); // missing digest never matches
+    }
+
+    /// Real releases/latest API shape: the macOS asset must be picked out of
+    /// a mixed asset list with its url/size/digest.
+    #[test]
+    fn parses_release_assets_for_auto_update() {
+        let raw = r#"{
+          "tag_name": "v0.1.17",
+          "html_url": "https://github.com/liujunGH/kimi-ui/releases/tag/v0.1.17",
+          "body": "- notes",
+          "assets": [
+            {"name": "kimi-ui-windows-x64.zip", "size": 100,
+             "digest": "sha256:1111", "browser_download_url": "https://x/w.zip"},
+            {"name": "kimi-ui-macos-arm64.zip", "size": 18168065,
+             "digest": "sha256:7960187b",
+             "browser_download_url": "https://github.com/liujunGH/kimi-ui/releases/download/v0.1.17/kimi-ui-macos-arm64.zip"}
+          ]
+        }"#;
+        let info = parse_release_json(raw).unwrap();
+        assert_eq!(info.latest, "0.1.17");
+        assert!(!info.has_update); // 0.1.17 is not newer than the current 0.1.18.
+        assert_eq!(info.asset_url.ends_with("kimi-ui-macos-arm64.zip"), true);
+        assert_eq!(info.asset_size, 18168065);
+        assert_eq!(info.asset_digest, "sha256:7960187b");
+
+        // No macOS asset -> no UpdateInfo at all (auto-update impossible).
+        let raw_no_asset = r#"{"tag_name":"v9","html_url":"u","body":"","assets":[]}"#;
+        assert!(parse_release_json(raw_no_asset).is_none());
     }
 }

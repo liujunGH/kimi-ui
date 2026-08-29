@@ -16,7 +16,7 @@
 - **下载与外链**：会话导出自动存 `~/Downloads` 去重；外部链接走系统浏览器
 - **界面自愈与三层看门狗**：官方改版导致 DOM/协议/格式漂移时明确告警，不静默坏掉
 - **系统 WebView**：不打包 Chromium；完整内存包含官方页面和 WebKit 辅助进程，随会话规模变化，基线与预算见 [性能文档](docs/performance.md)
-- **CI 发版 + 更新提示**：Releases 直接下载 .app，应用内检测新版本
+- **CI 发版 + 应用内自动更新**：Releases 供下载；macOS 在应用内完成下载（sha256 校验）、原地替换与重启，Windows 引导浏览器下载
 
 ## 安装
 
@@ -44,7 +44,7 @@ bash packaging/make-app.sh --install                  # 编译、组包并安装
 1. 检查 kimi CLI 是否安装及版本（< 0.39.1 引导 `kimi upgrade`，未安装引导官方文档）
 2. 发现已有服务实例则直接 attach（版本低于已安装 CLI 的旧 daemon 会被跳过并优雅关停，保证升级生效）；否则选择空闲端口并后台拉起 `kimi web --no-open`（App 退出时回收），再从 `server/instances` 注册表（回退旧版 `server/lock`，TCP 探活跳过失效项）发现地址、读取访问凭据
 3. 内置静态服务（127.0.0.1:51821，避开官方 daemon 的 58627+ 端口段）托管官方 web 包（release 编译期内嵌进 exe，单文件分发；开发时从 web-dist 磁盘读取），通过官方支持的 `kimi_origin` 参数和 URL hash 交接 daemon 地址与凭据；稳定 origin 保留界面偏好，内容哈希资源使用长期缓存，包缺失时回退 daemon 内嵌官方 UI
-4. 状态栏是壳自有页面，直连 daemon REST（上下文用量、套餐额度、Remote Control 状态）；注入脚本只补桌面能力（通知、拖拽、会话路由上报等）；更新提示带版本说明（Release notes 由 CI 自动生成）
+4. 状态栏是壳自有页面，直连 daemon REST（上下文用量、套餐额度、Remote Control 状态）；注入脚本只补桌面能力（通知、拖拽、会话路由上报等）；更新提示带版本说明（Release notes 由 CI 自动生成），macOS 支持应用内自动更新（匿名下载 + sha256 校验 + 原地替换重启）
 
 ## 与上游的关系
 

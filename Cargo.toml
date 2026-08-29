@@ -1,6 +1,6 @@
 [package]
 name = "kimi-ui"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 description = "Tauri desktop shell for the official Kimi Code web UI"
 

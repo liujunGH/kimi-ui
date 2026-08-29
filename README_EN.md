@@ -16,7 +16,7 @@ A desktop client for [Kimi Code](https://www.kimi.com/code/): **official daemon 
 - **Downloads & external links**: exports land in `~/Downloads` de-duplicated; links open in the system browser
 - **Self-healing + three-layer watchdog**: loud warnings (never silent breakage) when official updates drift the DOM, protocol, or scrape format
 - **System WebView**: no bundled Chromium; the full footprint includes the official page and WebKit helper processes and scales with session size — see the [performance baseline](docs/performance.md)
-- **CI releases + update check**: download the .app from Releases; the app checks for new versions itself
+- **CI releases + in-app auto-update**: Releases remain downloadable; on macOS the app downloads (sha256-verified), swaps itself in place and relaunches; Windows keeps the browser flow
 
 ## Install
 

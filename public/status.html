@@ -241,8 +241,49 @@
       pollPlanUsage();
       setInterval(pollPlanUsage, 60000);
 
-      // ---- update check (badge -> overlay card with the release notes) ----
+      // ---- update check (badge -> overlay card with notes + auto-update) ----
       var updateInfo = null;
+      var autoTimer = null;
+      var autoLine = null;      // status line while downloading/installing
+      var autoBtn = null;       // the action button (自动更新/安装并重启/重试)
+      function setAutoLine(text) {
+        if (autoLine) autoLine.textContent = text || '';
+      }
+      function stopAutoPoll() {
+        if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+      }
+      function startAutoPoll() {
+        stopAutoPoll();
+        autoTimer = setInterval(function () {
+          if (mode !== 'update') { stopAutoPoll(); return; }
+          invoke('auto_update', { action: 'status' }).then(renderAutoState).catch(function () {});
+        }, 1000);
+      }
+      function renderAutoState(d) {
+        if (!d || !autoBtn) return;
+        if (d.phase === 'downloading') {
+          setAutoLine('下载中 ' + (d.pct || 0) + '%');
+          autoBtn.textContent = '下载中 ' + (d.pct || 0) + '%';
+          autoBtn.onclick = null;
+        } else if (d.phase === 'verifying') {
+          setAutoLine('校验中…');
+          autoBtn.textContent = '校验中…';
+          autoBtn.onclick = null;
+        } else if (d.phase === 'ready') {
+          setAutoLine(d.message || '已就绪');
+          autoBtn.textContent = '安装并重启';
+          autoBtn.onclick = function () { invoke('auto_update', { action: 'install' }).catch(function () {}); };
+          stopAutoPoll();
+        } else if (d.phase === 'error') {
+          setAutoLine(d.message || '更新失败');
+          autoBtn.textContent = '重试';
+          autoBtn.onclick = function () {
+            invoke('auto_update', { action: 'start' }).catch(function () {});
+            startAutoPoll();
+          };
+          stopAutoPoll();
+        }
+      }
       function renderUpdate() {
         var d = updateInfo;
         if (!d) return;
@@ -254,14 +295,39 @@
         var pre = document.createElement('pre');
         pre.textContent = d.notes && d.notes.trim() ? d.notes : '（该版本未提供版本说明）';
         card.appendChild(pre);
+        autoLine = document.createElement('div');
+        autoLine.className = 'dim';
+        autoLine.style.marginTop = '8px';
+        card.appendChild(autoLine);
+        if (d.can_auto_update) {
+          autoBtn = document.createElement('span');
+          autoBtn.className = 'go';
+          autoBtn.textContent = '自动更新';
+          autoBtn.onclick = function () {
+            invoke('auto_update', { action: 'start' }).catch(function () {});
+            startAutoPoll();
+          };
+          card.appendChild(autoBtn);
+        }
         var go = document.createElement('span');
         go.className = 'go';
+        go.style.marginLeft = '16px';
         go.textContent = '前往下载 →';
         go.onclick = function () { invoke('open_url', { url: d.url }); };
         card.appendChild(go);
+        // If a pipeline is already mid-flight, resume its display.
+        invoke('auto_update', { action: 'status' }).then(function (s) {
+          if (s && s.phase && s.phase !== 'idle') { startAutoPoll(); renderAutoState(s); }
+        }).catch(function () {});
       }
       function pollUpdate() {
         invoke('update_info').then(function (d) {
+          if (d === null) {
+            // The release check hasn't answered yet — retry soon instead of
+            // waiting out the whole 30-minute interval.
+            if (updateCheckTries++ < 30) setTimeout(pollUpdate, 5000);
+            return;
+          }
           var el = document.getElementById('updateBadge');
           if (d && d.has_update) {
             updateInfo = d;
@@ -272,6 +338,7 @@
           }
         }).catch(function () {});
       }
+      var updateCheckTries = 0;
       pollUpdate();
       setInterval(pollUpdate, 30 * 60 * 1000);
 
