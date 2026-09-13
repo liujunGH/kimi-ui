@@ -128,12 +128,12 @@
       <span id="plan" class="dim" title="套餐额度（每 10 分钟更新）"></span>
       <span id="updateBadge" class="btn" style="display:none" title="点击打开下载页">⬆ 新版本</span>
       <span id="freezeBtn" class="btn" title="流式输出时是否自动跟随到底部">跟随</span>
+      <span id="restartBtn" class="btn" title="用已安装的 CLI 在原端口重启本地 daemon">重启</span>
       <span id="devtoolsBtn" class="btn" title="打开/关闭 Safari Web Inspector（内存/DOM 剖析）">调试</span>
       <span id="rcBtn" class="btn" title="Remote Control：从手机或其他电脑访问本机（官方实验特性）">远程</span>
     </div>
     <script>
       'use strict';
-      var daemon = null;
       var mode = 'none';            // 'none' | 'usage' | 'update' | 'remote'
       var lastUsage = null;
       var planUsage = null;
@@ -182,17 +182,52 @@
         this.className = this.className === 'btn' ? 'btn active' : 'btn';
       };
 
-      // ---- boot: wait for daemon info from Rust ----
-      function boot(tries) {
-        invoke('daemon_info').then(function (info) {
-          daemon = info;
-          pollUsage();
-          setInterval(pollUsage, 12000);
-        }).catch(function () {
-          if (tries > 0) setTimeout(function () { boot(tries - 1); }, 600);
-          else document.getElementById('usage').textContent = 'daemon 未就绪';
-        });
+      // Restart the LOCAL daemon (same port, freshly launched CLI). Hidden for
+      // remote connections, where it would target someone else's machine.
+      var restartBtn = document.getElementById('restartBtn');
+      function refreshRestartVisibility() {
+        invoke('list_connections').then(function (d) {
+          var active = d && d.active;
+          var conn = ((d && d.connections) || []).filter(function (c) { return c.id === active; })[0];
+          restartBtn.style.display = conn && conn.kind === 'remote' ? 'none' : '';
+        }).catch(function () {});
       }
+      restartBtn.onclick = function () {
+        var el = this;
+        el.textContent = '重启中…';
+        invoke('restart_daemon').then(function () {
+          el.textContent = '重启';
+          el.className = 'btn';
+          window.__kimiConnChanged();
+        }).catch(function (e) {
+          el.textContent = '重启';
+          el.className = 'btn';
+          el.title = String(e);
+        });
+      };
+      refreshRestartVisibility();
+
+      // ---- boot: poll the active connection through Rust ----
+      // No daemon_info handshake is needed any more: the Rust side owns the
+      // daemon details (and the token), so the page just asks for a snapshot.
+      function boot() {
+        pollUsage();
+        setInterval(pollUsage, 12000);
+      }
+      // Rust calls this when the user switches tabs, so the strip reflects
+      // the newly active connection immediately.
+      window.__kimiConnChanged = function () {
+        lastUsage = null;
+        planUsage = null;
+        rcStateCache = null;
+        rcRenderedSig = null;
+        health = 'ok';
+        document.getElementById('usage').textContent = '…';
+        document.getElementById('plan').textContent = '';
+        pollUsage();
+        pollPlanUsage();
+        refreshRestartVisibility();
+      };
 
       // ---- plan quota (daemon REST /api/v1/oauth/usage; the Rust side
       //      fetches and caches, we format the reset timestamps) ----
@@ -345,32 +380,31 @@
       // ---- usage polling + structural health check ----
       // Three states: ok / down (daemon unreachable, transient) / broken
       // (daemon alive but REST shape drifted → shell needs an update).
+      // Data comes from Rust (`daemon_snapshot`) rather than a webview fetch:
+      // this page's origin is tauri://localhost, so a cross-origin request to
+      // a remote daemon would be rejected by its origin check.
       var health = 'ok';
       function setHealth(next) {
         if (health === next) return;
         health = next;
         renderBar();
       }
-      function api(path) {
-        return fetch(daemon.base + path, { headers: { Authorization: 'Bearer ' + daemon.token } })
-          .then(function (r) { return r.json(); });
-      }
       function pollUsage() {
-        if (!daemon) return;
-        api('/api/v1/meta').then(function () {
-          return api('/api/v1/sessions?page_size=50').then(function (d) {
-            var items = d.data && d.data.items;
-            if (!items) { setHealth('broken'); return; }
-            setHealth('ok');
-            var pick = items.find(function (s) { return s.busy; })
-              || items.filter(function (s) { return !s.archived; })[0];
-            if (!pick) return;
-            return api('/api/v1/sessions/' + pick.id + '/status').then(function (d2) {
-              lastUsage = { session: pick, status: d2.data || {} };
-              renderBar();
-              if (mode === 'usage') renderUsageCard();
-            });
-          });
+        invoke('daemon_snapshot').then(function (d) {
+          if (!d || d.state === 'down') { setHealth('down'); return; }
+          if (d.state === 'broken') { setHealth('broken'); return; }
+          setHealth('ok');
+          // A daemon with no sessions yet still means "connected"; show that
+          // rather than leaving the strip stuck on the loading dots.
+          if (!d.session) {
+            lastUsage = null;
+            document.getElementById('usage').textContent = '暂无会话';
+            document.getElementById('dot').className = '';
+            return;
+          }
+          lastUsage = { session: d.session, status: d.status || {} };
+          renderBar();
+          if (mode === 'usage') renderUsageCard();
         }).catch(function () { setHealth('down'); });
       }
       function renderBar() {
@@ -473,9 +507,7 @@
         setTimeout(function () { if (mode === 'remote') pollRemote(); }, 400);
       }
 
-      boot(20);
-
-      boot(20);
+      boot();
     </script>
   </body>
 </html>

@@ -15,11 +15,18 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
-    <string>19</string>
+    <string>20</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.18</string>
+    <string>0.1.19</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <!-- A connection view loads a remote daemon's UI directly over plain http
+         on a LAN address; without this ATS blocks the load. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

@@ -8,6 +8,7 @@ A desktop client for [Kimi Code](https://www.kimi.com/code/): **official daemon 
 
 - **Real app form**: own window, Dock icon, Cmd-Tab, close-to-quit; hidden-inset title bar with drag regions and double-click zoom
 - **Official Web UI**: consumes the prebuilt bundle from the pinned Kimi Code release, keeping UI features and protocol behavior aligned with upstream
+- **Multi-daemon tabs**: the local daemon and daemons on other LAN machines each get a tab, click to switch; see [remote connections](docs/remote-connections.md)
 - **Native menu bar**: app/file/edit/sessions/window/help menus with ⌘N new session; the Sessions menu lists recent sessions dynamically, click to jump
 - **Session-aware window title**: the title follows the current session, readable in Cmd-Tab and Mission Control
 - **Shell-owned status bar**: a trusted local WebView for context usage, plan quota (5h/weekly), busy state, follow/freeze, and updates
@@ -16,7 +17,8 @@ A desktop client for [Kimi Code](https://www.kimi.com/code/): **official daemon 
 - **Downloads & external links**: exports land in `~/Downloads` de-duplicated; links open in the system browser
 - **Self-healing + three-layer watchdog**: loud warnings (never silent breakage) when official updates drift the DOM, protocol, or scrape format
 - **System WebView**: no bundled Chromium; the full footprint includes the official page and WebKit helper processes and scales with session size — see the [performance baseline](docs/performance.md)
-- **CI releases + in-app auto-update**: Releases remain downloadable; on macOS the app downloads (sha256-verified), swaps itself in place and relaunches; Windows keeps the browser flow
+- **CI releases + in-app auto-update**: Releases remain downloadable; on macOS the app downloads (minisign-verified), swaps itself in place and relaunches; Windows keeps the browser flow
+- **Restartable local engine**: the status bar's restart gracefully stops the daemon and relaunches it on the same port (verified by a changed instance pid)
 
 ## Install
 

@@ -1,5 +1,13 @@
 name: release
 
+# In-app updates need two repository secrets before the macOS job can sign the
+# update payload (Settings → Secrets and variables → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY          contents of ~/.tauri/kimi-ui.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD the key's password ("" if none)
+# The matching public key lives in tauri.conf.json → plugins.updater.pubkey.
+# Losing the private key means existing installs can no longer verify updates
+# and users must reinstall by hand.
+
 on:
   push:
     tags: ['v*']
@@ -35,6 +43,15 @@ jobs:
       - name: Zip the app bundle
         run: cd build && ditto -c -k --sequesterRsrc --keepParent "Kimi Code.app" ../kimi-ui-macos-arm64.zip
 
+      # In-app updater: the plugin downloads a signed .app.tar.gz described by
+      # latest.json, so both must be produced here. The tar.gz is written from
+      # the same staged bundle the .zip uses, keeping the two in lockstep.
+      - name: Build the updater artifact (.app.tar.gz) and sign it
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bash scripts/make-update-manifest.sh
+
       - name: Extract release notes from CHANGELOG.md
         shell: bash
         run: |
@@ -44,7 +61,10 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: kimi-ui-macos-arm64.zip
+          files: |
+            kimi-ui-macos-arm64.zip
+            kimi-ui-macos-arm64.app.tar.gz
+            latest.json
           body_path: notes.md
 
   windows:

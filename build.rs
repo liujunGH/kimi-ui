@@ -25,6 +25,13 @@ fn main() {
             "set_active_session",
             "remote_control",
             "auto_update",
+            "restart_daemon",
+            "list_connections",
+            "connection_status",
+            "add_remote_connection",
+            "remove_connection",
+            "switch_connection",
+            "daemon_snapshot",
         ]),
     ))
     .expect("failed to run tauri-build");

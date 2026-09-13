@@ -4,6 +4,14 @@
 打 `v*` tag 发版时，CI 自动截取对应段落作为 GitHub Release 的 notes；
 应用内"更新提示"卡片展示的也是这里的内容。版本说明一律使用中文。
 
+## 0.1.19 - 2026-09-13
+
+- 新增多 daemon 连接与顶部标签栏：可添加内网其他机器的 daemon（地址 + `server.token`），本地与远程各占一个标签、点击即时切换；连接持久化在 `~/Library/Application Support/dev.kimiui.desktop/connections.json`（0600）。远程标签直接加载对方 daemon 自带的界面（同源，无需远端配 CORS），状态栏、窗口标题、"会话"菜单都跟随当前标签
+- 修复 daemon 重启不可靠：退出改用 SIGTERM 让官方 CLI 走自身关停流程（SIGKILL 会残留过期 `server/instances` 记录，误导下次启动）；attach 改为带 token 的 `/api/v1/meta` 探活（正在关闭的 daemon 仍会接受 TCP 连接）；新增"重启本地 Engine"（状态栏按钮 + 帮助菜单），按"优雅关停 → 等端口释放 → 原址重启 → 等实例 pid 变化"完成，8/12 秒超时不硬来
+- 自动更新改用官方 `tauri-plugin-updater`：以 minisign 签名校验（取代原先仅比对 sha256 摘要的 curl 手写流程），下载/校验/安装/重启由插件完成；CI 新增产出签名后的 `.app.tar.gz` 与 `latest.json`。**注意：制作更新包必须用 `tar --no-xattrs --no-mac-metadata`**——macOS 的 BSD tar 默认写入带 `com.apple.provenance` 的 PAX 扩展头，插件的解包器会因此失败（`failed to unpack ._Kimi Code.app`）
+- 状态栏数据改由 Rust 代理获取（`daemon_snapshot`）：状态栏页面自身来源是 `tauri://localhost`，跨机时直接 fetch 远端 daemon 会被其来源校验拒绝，改为壳侧请求后本地/远程统一
+- 远端标签的桌面能力通过运行时 capability 精确授权（仅放行该 daemon 的来源）；`Info.plist` 增加 `NSAllowsLocalNetworking` 以便加载局域网 `http://` 地址
+
 ## 0.1.18 - 2026-08-29
 
 - 新增应用内自动更新（macOS）：更新卡新增"自动更新"，后台下载官方 Release 的 zip 并按 sha256 摘要校验，一键原地替换当前应用并自动重启，无需再手动下载解压；替换失败自动回滚，Windows 继续引导浏览器下载

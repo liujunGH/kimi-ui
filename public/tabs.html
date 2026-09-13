@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>tabs</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 36px;
+        overflow: hidden;
+        font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+        font-size: 12px;
+        background: transparent;
+        user-select: none;
+      }
+      :root {
+        --bg: rgba(246, 246, 246, 0.96);
+        --fg: #24292f;
+        --dim: #57606a;
+        --border: #d0d7de;
+        --active: rgba(0, 0, 0, 0.07);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: rgba(38, 38, 40, 0.96);
+          --fg: #c9d1d9;
+          --dim: #8b949e;
+          --border: #3a3a3c;
+          --active: rgba(255, 255, 255, 0.12);
+        }
+      }
+      #bar {
+        height: 36px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 0 8px 0 78px; /* leave room for the macOS traffic lights */
+        box-sizing: border-box;
+        background: var(--bg);
+        border-bottom: 1px solid var(--border);
+      }
+      #tabs { display: flex; align-items: center; gap: 4px; overflow: hidden; flex: 1; }
+      .tab {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        max-width: 190px;
+        padding: 3px 8px;
+        border-radius: 7px;
+        color: var(--dim);
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .tab:hover { background: var(--active); }
+      .tab.active { background: var(--active); color: var(--fg); font-weight: 600; }
+      .tab .name { overflow: hidden; text-overflow: ellipsis; }
+      .tab .dot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; background: #8b949e; }
+      .tab .dot.local { background: #3fb950; }
+      .tab .dot.remote { background: #1f6feb; }
+      .tab .close {
+        display: none;
+        color: var(--dim);
+        font-weight: 400;
+        padding: 0 2px;
+        border-radius: 4px;
+      }
+      .tab:hover .close { display: inline; }
+      .tab .close:hover { background: rgba(248, 81, 73, 0.2); color: #f85149; }
+      .btn {
+        color: var(--dim);
+        cursor: pointer;
+        padding: 3px 8px;
+        border-radius: 7px;
+        font-weight: 600;
+        flex: 0 0 auto;
+      }
+      .btn:hover { background: var(--active); color: var(--fg); }
+      /* The empty area right of the tabs drags the window. */
+      #spacer { flex: 1; min-width: 8px; }
+      #dialog {
+        position: fixed;
+        top: 40px;
+        left: 88px;
+        display: none;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        box-shadow: 0 10px 34px rgba(0, 0, 0, 0.24);
+        padding: 12px;
+        width: 300px;
+        color: var(--fg);
+      }
+      #dialog.show { display: block; }
+      #dialog h3 { margin: 0 0 8px; font-size: 12px; }
+      #dialog label { display: block; margin: 6px 0 2px; color: var(--dim); }
+      #dialog input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 5px 7px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font-size: 12px;
+        background: transparent;
+        color: var(--fg);
+      }
+      #dialog .hint { color: var(--dim); font-size: 11px; line-height: 1.5; margin-top: 8px; }
+      #dialog .err { color: #f85149; font-size: 11px; margin-top: 6px; min-height: 14px; }
+      #dialog .actions { margin-top: 10px; text-align: right; }
+      #dialog .actions span {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 4px 12px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      #dialog .actions span.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+    </style>
+  </head>
+  <body>
+    <div id="bar" data-tauri-drag-region>
+      <div id="tabs"></div>
+      <div id="spacer" data-tauri-drag-region></div>
+      <span id="addBtn" class="btn" title="连接到内网其他机器的 daemon">＋ 连接</span>
+    </div>
+    <div id="dialog">
+      <h3>添加远程 daemon</h3>
+      <label>地址（host:port）</label>
+      <input id="addr" placeholder="192.168.1.10:58627" spellcheck="false" />
+      <label>名称（可选）</label>
+      <input id="name" placeholder="例如：台式机" spellcheck="false" />
+      <label>访问令牌 server.token</label>
+      <input id="token" placeholder="从远端 ~/.kimi-code/server.token 复制" spellcheck="false" />
+      <div class="hint">
+        远端需以 <code>kimi web --host 0.0.0.0 --insecure-no-tls --no-open</code> 启动。
+        链接与令牌等同于那台机器的完全控制权，请勿外传。
+      </div>
+      <div class="err" id="err"></div>
+      <div class="actions">
+        <span id="cancel">取消</span>
+        <span id="ok" class="primary">连接</span>
+      </div>
+    </div>
+    <script>
+      'use strict';
+      var active = null;
+      var conns = [];
+
+      function invoke(cmd, args) {
+        return window.__TAURI_INTERNALS__.invoke(cmd, args || {});
+      }
+      function esc(s) {
+        return String(s).replace(/[&<>"]/g, function (c) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+        });
+      }
+
+      function render() {
+        var box = document.getElementById('tabs');
+        box.innerHTML = '';
+        conns.forEach(function (c) {
+          var tab = document.createElement('div');
+          tab.className = 'tab' + (c.id === active ? ' active' : '');
+          var dot = document.createElement('span');
+          dot.className = 'dot ' + (c.kind || '');
+          tab.appendChild(dot);
+          var nm = document.createElement('span');
+          nm.className = 'name';
+          nm.textContent = c.name;
+          nm.title = c.base || '';
+          tab.appendChild(nm);
+          if (c.id !== 'local') {
+            var x = document.createElement('span');
+            x.className = 'close';
+            x.textContent = '×';
+            x.title = '关闭连接';
+            x.onclick = function (e) {
+              e.stopPropagation();
+              invoke('remove_connection', { id: c.id }).catch(function () {});
+            };
+            tab.appendChild(x);
+          }
+          tab.onclick = function () {
+            if (c.id !== active) invoke('switch_connection', { id: c.id }).catch(function () {});
+          };
+          box.appendChild(tab);
+        });
+      }
+
+      // Called by Rust after every state change.
+      window.__kimiTabs = function (payload) {
+        conns = (payload && payload.connections) || [];
+        active = payload && payload.active;
+        render();
+      };
+
+      document.getElementById('addBtn').onclick = function () {
+        document.getElementById('dialog').className = 'show';
+        document.getElementById('err').textContent = '';
+        document.getElementById('addr').focus();
+      };
+      document.getElementById('cancel').onclick = function () {
+        document.getElementById('dialog').className = '';
+      };
+      document.getElementById('ok').onclick = function () {
+        var err = document.getElementById('err');
+        err.textContent = '连接中…';
+        invoke('add_remote_connection', {
+          name: document.getElementById('name').value,
+          address: document.getElementById('addr').value,
+          token: document.getElementById('token').value
+        }).then(function () {
+          document.getElementById('dialog').className = '';
+          document.getElementById('addr').value = '';
+          document.getElementById('name').value = '';
+          document.getElementById('token').value = '';
+          err.textContent = '';
+        }).catch(function (e) {
+          err.textContent = String(e);
+        });
+      };
+    </script>
+  </body>
+</html>

@@ -83,8 +83,9 @@ use tauri_plugin_notification::NotificationExt;
 
 mod static_server;
 
-/// Status strip height (collapsed) and overlay height (card open).
+/// Status strip height (collapsed), tab bar height, and overlay height (open).
 const STRIP: f64 = 28.0;
+const TABBAR_H: f64 = 36.0;
 const OVERLAY_H: f64 = 340.0;
 /// Stable, shell-owned origin so Web Storage survives app restarts. Keep this
 /// outside Kimi's 58627+ daemon port range.
@@ -104,6 +105,167 @@ struct DaemonState {
 }
 
 type SharedDaemon = Mutex<Option<DaemonState>>;
+
+// ---------------------------------------------------------------------------
+// Connections (the tab bar's model).
+//
+// The shell can view several daemons at once: the local one it manages, plus
+// any remote daemon the user points it at. Each connection is one child
+// webview; only the active one is visible.
+//
+// How each kind is loaded matters:
+//   - Local  -> the shell's own loopback static server (stable origin: keeps
+//               UI preferences and long-lived hash asset caching) with the
+//               daemon origin handed over via `kimi_origin`.
+//   - Remote -> the daemon's OWN served UI, same-origin. The official SPA
+//               resolves its API origin from `window.location.origin` when no
+//               `kimi_origin` is given (verified in the 0.42.0 bundle), which
+//               is exactly the flow `kimi web` uses when it opens a browser.
+//               Same-origin also means no CORS allow-list on the far side.
+// ---------------------------------------------------------------------------
+
+/// Where a connection's UI comes from.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnKind {
+    /// The daemon this machine's CLI runs; managed by the shell.
+    Local,
+    /// Someone else's daemon, reached by address.
+    Remote,
+}
+
+/// One viewable daemon.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Connection {
+    /// Stable key for the webview label and menu ids.
+    id: String,
+    /// Shown on the tab.
+    name: String,
+    kind: ConnKind,
+    /// `http://host:port` (no query).
+    base: String,
+    /// Bearer token (empty until known for the local daemon).
+    token: String,
+}
+
+/// `(id, name)` of every connection, for the status page's tab bar.
+type SharedConnections = Mutex<Vec<Connection>>;
+/// Id of the connection currently shown.
+type SharedActive = Mutex<Option<String>>;
+
+/// Webview label for a connection's view. Tauri restricts labels to
+/// alphanumerics plus `- / : _`, and a connection id is derived from a host
+/// (dots!) so it must be sanitized.
+fn view_label(id: &str) -> String {
+    let safe: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | ':' | '_') { c } else { '_' })
+        .collect();
+    format!("view-{safe}")
+}
+
+/// URL to load for a connection.
+///
+/// Local daemons go through the shell's loopback server (stable origin);
+/// remote ones load the daemon's own UI, which is same-origin and therefore
+/// needs no `kimi_origin` and no CORS entry on the far side.
+fn connection_url(conn: &Connection) -> Url {
+    match conn.kind {
+        ConnKind::Local => custom_ui_url(&conn.base, &conn.token)
+            .unwrap_or_else(|| conn.base.parse().expect("valid local url")),
+        ConnKind::Remote => {
+            let base = conn.base.trim_end_matches('/');
+            format!("{base}/?kimi_desktop&platform={}#token={}", platform_name(), conn.token)
+                .parse()
+                .expect("valid remote url")
+        }
+    }
+}
+
+/// Node's `process.platform` value — the official bundle reads this flag.
+fn platform_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "win32"
+    } else {
+        "linux"
+    }
+}
+
+fn connections_path() -> PathBuf {
+    app_config_dir().join("connections.json")
+}
+
+fn app_config_dir() -> PathBuf {
+    // ~/Library/Application Support/<bundle id> on macOS.
+    home_dir()
+        .join("Library/Application Support")
+        .join("dev.kimiui.desktop")
+}
+
+/// Load persisted remote connections (the local one is always derived fresh).
+fn load_connections() -> Vec<Connection> {
+    let Ok(raw) = fs::read_to_string(connections_path()) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<Connection>>(&raw).unwrap_or_default()
+}
+
+/// Persist remote connections with owner-only permissions: the file holds
+/// bearer tokens, matching how the official CLI stores its own `server.token`.
+fn save_connections(conns: &[Connection]) {
+    let remote: Vec<&Connection> = conns.iter().filter(|c| c.kind == ConnKind::Remote).collect();
+    let Ok(json) = serde_json::to_string_pretty(&remote) else { return };
+    let dir = app_config_dir();
+    let _ = fs::create_dir_all(&dir);
+    let path = connections_path();
+    if fs::write(&path, json).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// Validate a user-entered remote address into a connection. Accepts
+/// `host:port`, `http://host:port`, or a bare host (default port 58627).
+fn parse_remote_connection(name: &str, address: &str, token: &str) -> Result<Connection, String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err("请填写地址".to_string());
+    }
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let url: Url = with_scheme
+        .parse()
+        .map_err(|_| format!("地址无法解析：{address}"))?;
+    let Some(host) = url.host_str() else {
+        return Err("地址缺少主机名".to_string());
+    };
+    if host.is_empty() {
+        return Err("地址缺少主机名".to_string());
+    }
+    let port = url.port().unwrap_or(58627);
+    let base = format!("http://{host}:{port}");
+    let name = if name.trim().is_empty() {
+        format!("{host}:{port}")
+    } else {
+        name.trim().to_string()
+    };
+    Ok(Connection {
+        id: format!("{host}-{port}"),
+        name,
+        kind: ConnKind::Remote,
+        base,
+        token: token.trim().to_string(),
+    })
+}
 
 /// Script injected at document start on the MAIN webview's pages only
 /// (WKUserScript is not affected by the SPA's CSP).
@@ -454,23 +616,49 @@ fn connect_daemon() -> Result<Launch, BootError> {
 }
 
 /// Attach to a reachable daemon (single attempt) and build the launch params.
+/// Candidates are verified with an authenticated `/api/v1/meta` probe rather
+/// than a bare TCP connect: a daemon that is shutting down still accepts
+/// sockets, and latching onto one would leave the app talking to a dying
+/// server. Falls through every candidate until one actually answers.
 fn attach(home: &Path, cli_version: Option<&str>) -> Result<Launch, String> {
-    let addr = discover_daemon(home, cli_version)?;
-    launch_at(home, addr)
+    let token = read_server_token(home).ok_or("读取 server.token 失败")?;
+    let candidates = daemon_candidates(home, cli_version);
+    let mut last = String::from("没有发现可达的 kimi daemon（server/instances 与 server/lock 均无效）");
+    for addr in candidates {
+        if !tcp_alive(&addr.host, addr.port) {
+            continue;
+        }
+        match daemon_meta(&addr, &token) {
+            Ok(_) => return launch_at_addr(&token, addr),
+            Err(e) => last = format!("daemon {}:{} 无响应：{e}", addr.host, addr.port),
+        }
+    }
+    Err(last)
+}
+
+fn read_server_token(home: &Path) -> Option<String> {
+    fs::read_to_string(home.join("server.token"))
+        .ok()
+        .map(|t| t.trim().to_string())
 }
 
 /// Build launch details for a specific reachable server.
 fn launch_at(home: &Path, addr: DaemonAddr) -> Result<Launch, String> {
-    let token = fs::read_to_string(home.join("server.token"))
-        .map_err(|e| format!("读取 server.token 失败：{e}"))?;
-    let token = token.trim().to_string();
+    let token = read_server_token(home).ok_or("读取 server.token 失败")?;
+    launch_at_addr(&token, addr)
+}
 
+fn launch_at_addr(token: &str, addr: DaemonAddr) -> Result<Launch, String> {
     let desktop_query = desktop_query();
     let base = format!("http://{}:{}", addr.host, addr.port);
     let url = format!("{base}/{desktop_query}#token={token}")
         .parse()
         .map_err(|e| format!("构造 web UI 地址失败：{e}"))?;
-    Ok(Launch { base, token, url })
+    Ok(Launch {
+        base,
+        token: token.to_string(),
+        url,
+    })
 }
 
 /// Official bundle flags for desktop-only behavior. Keep the platform values
@@ -611,14 +799,10 @@ fn daemon_stale(host_version: Option<&str>, cli_version: Option<&str>) -> bool {
     }
 }
 
-/// Discover a live daemon address: scan the multi-instance registry
-/// (`server/instances/*.json`, longest-running first), then fall back to the
-/// legacy single-instance `server/lock`. Mirrors kap-server's own discovery
-/// order (`packages/kap-server/src/instanceRegistry.ts`). Every candidate is
-/// verified with a TCP connect, so stale files from crashed daemons are
-/// skipped instead of fatal. Daemons older than the installed CLI are skipped
-/// too, so an upgraded CLI is not shadowed by a long-running old server.
-fn discover_daemon(home: &Path, cli_version: Option<&str>) -> Result<DaemonAddr, String> {
+/// Ordered candidate addresses from the multi-instance registry (longest
+/// running first) plus the legacy lock. Pure parsing — no liveness checks, so
+/// callers can apply their own (TCP-only vs authenticated).
+fn daemon_candidates(home: &Path, cli_version: Option<&str>) -> Vec<DaemonAddr> {
     let mut candidates: Vec<(u64, String, u16)> = Vec::new();
 
     if let Ok(rd) = fs::read_dir(home.join("server/instances")) {
@@ -657,9 +841,28 @@ fn discover_daemon(home: &Path, cli_version: Option<&str>) -> Result<DaemonAddr,
         }
     }
 
-    for (_, host, port) in candidates {
-        if tcp_alive(&host, port) {
-            return Ok(DaemonAddr { host, port });
+    candidates
+        .into_iter()
+        .map(|(_, host, port)| DaemonAddr { host, port })
+        .collect()
+}
+
+/// Discover a live daemon address: scan the multi-instance registry
+/// (`server/instances/*.json`, longest-running first), then fall back to the
+/// legacy single-instance `server/lock`. Mirrors kap-server's own discovery
+/// order (`packages/kap-server/src/instanceRegistry.ts`). Every candidate is
+/// verified with a TCP connect, so stale files from crashed daemons are
+/// skipped instead of fatal. Daemons older than the installed CLI are skipped
+/// too, so an upgraded CLI is not shadowed by a long-running old server.
+///
+/// TCP-only discovery: kept for tests and diagnostics. Production attach uses
+/// `daemon_candidates` plus an authenticated probe (a shutting-down daemon
+/// still accepts sockets), so this variant is test-only.
+#[cfg(test)]
+fn discover_daemon(home: &Path, cli_version: Option<&str>) -> Result<DaemonAddr, String> {
+    for addr in daemon_candidates(home, cli_version) {
+        if tcp_alive(&addr.host, addr.port) {
+            return Ok(addr);
         }
     }
     Err("没有发现可达的 kimi daemon（server/instances 与 server/lock 均无效）".to_string())
@@ -728,6 +931,161 @@ fn shutdown_stale_daemons(home: &Path, cli_version: Option<&str>, token: &str) {
     for addr in stale_daemons(home, cli_version) {
         shutdown_daemon(&addr, token);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon restart.
+//
+// Attaching to a port that answers TCP is not enough: a daemon in the middle
+// of shutting down still accepts connections, so a new instance can latch onto
+// a dying server. The restart below follows the sequence the sibling kimi-gui
+// shell uses, which is the difference between "usually works" and reliable:
+//   1. graceful shutdown via POST /api/v1/shutdown (bearer-authenticated,
+//      loopback-only, so there is no pid-reuse risk);
+//   2. wait for the port to actually stop accepting connections;
+//   3. relaunch the installed CLI on the same host/port;
+//   4. wait until the registry reports a DIFFERENT pid — proof the old server
+//      is gone and the new one is serving, not merely that a socket exists.
+// ---------------------------------------------------------------------------
+
+/// How long to wait for the old daemon to release its port.
+const STOP_WAIT: Duration = Duration::from_secs(8);
+/// How long to wait for the replacement daemon to register.
+const START_WAIT: Duration = Duration::from_secs(12);
+
+/// True when the daemon behind `addr` answers an authenticated request — a
+/// stronger liveness check than a bare TCP connect, because a shutting-down
+/// server may still accept sockets while refusing to serve.
+fn daemon_healthy(addr: &DaemonAddr, token: &str) -> bool {
+    daemon_meta(addr, token).is_ok()
+}
+
+/// `GET /api/v1/meta` against a specific address; Ok when the daemon answers
+/// 200 with a JSON envelope. Used both for liveness and for version reads.
+fn daemon_meta(addr: &DaemonAddr, token: &str) -> Result<Value, String> {
+    let base = format!("http://{}:{}", addr.host, addr.port);
+    http_get_json(&base, "/api/v1/meta", token)
+}
+
+/// The registry entry (pid + port) for a specific loopback endpoint.
+fn instance_pid_for(home: &Path, addr: &DaemonAddr) -> Option<u32> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(home.join("server/instances")) {
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".json") {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.push(home.join("server/lock"));
+    for path in paths {
+        let Ok(raw) = fs::read_to_string(&path) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&raw) else { continue };
+        let Some(port) = v["port"].as_u64() else { continue };
+        if port != u64::from(addr.port) || normalize_host(v["host"].as_str()) != addr.host {
+            continue;
+        }
+        if let Some(pid) = v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Terminate a spawned child politely: SIGTERM first so the CLI runs its own
+/// shutdown (relay/lock cleanup), then SIGKILL if it overstays. SIGKILL alone
+/// can leave a stale `server/instances/*.json` behind, which then misleads the
+/// next launch's discovery.
+fn terminate_child(child: &mut Child, grace: Duration) {
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        let _ = no_console(Command::new("kill")).arg(pid.to_string()).spawn();
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Stop the exact daemon the shell is attached to, then start the installed
+/// CLI again on the same address. Other instances are deliberately untouched.
+fn restart_daemon_at(base: &str, token: &str, addr: &DaemonAddr) -> Result<Launch, String> {
+    let home = kimi_home();
+    let old_pid = instance_pid_for(&home, addr);
+
+    let probe = DaemonAddr {
+        host: addr.host.clone(),
+        port: addr.port,
+    };
+    let launch = launch_at_addr(token, probe)?;
+    shutdown_daemon(addr, token);
+    let deadline = std::time::Instant::now() + STOP_WAIT;
+    while std::time::Instant::now() < deadline && tcp_alive(&addr.host, addr.port) {
+        thread::sleep(Duration::from_millis(150));
+    }
+    if tcp_alive(&addr.host, addr.port) {
+        return Err("daemon 未在 8 秒内退出；未启动第二个实例".to_string());
+    }
+
+    let kimi = find_kimi().ok_or("找不到 kimi CLI，请先安装或更新 Kimi Code")?;
+    let port_arg = addr.port.to_string();
+    let log = fs::File::create(web_stderr_log()).map_err(|e| e.to_string())?;
+    let mut child = no_console(Command::new(&kimi))
+        .args([
+            "web",
+            "--host",
+            addr.host.as_str(),
+            "--port",
+            port_arg.as_str(),
+            "--no-open",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .map_err(|e| format!("启动新版 daemon 失败：{e}"))?;
+
+    let start_deadline = std::time::Instant::now() + START_WAIT;
+    while std::time::Instant::now() < start_deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            let log = fs::read_to_string(web_stderr_log()).unwrap_or_default();
+            let tail = truncate_chars(log.trim(), 300);
+            return Err(format!("新版 daemon 启动失败（{status}）：{tail}"));
+        }
+        // Registration with a NEW pid is the proof we want.
+        if let Some(pid) = instance_pid_for(&home, addr) {
+            if Some(pid) != old_pid && daemon_healthy(addr, token) {
+                if let Ok(mut guard) = SPAWNED_SERVER.lock() {
+                    *guard = Some(child);
+                }
+                return Ok(Launch {
+                    base: base.to_string(),
+                    token: token.to_string(),
+                    url: launch.url,
+                });
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("新版 daemon 启动超时，已停止未就绪的进程".to_string())
+}
+
+/// Re-attach to the daemon address the shell already knows about.
+fn current_addr(base: &str) -> Option<DaemonAddr> {
+    let host_part = base.trim_start_matches("http://");
+    let (host, port) = host_part.rsplit_once(':')?;
+    Some(DaemonAddr {
+        host: host.to_string(),
+        port: port.parse().ok()?,
+    })
 }
 
 /// Dev-only: the official Kimi Code web bundle on disk —
@@ -821,9 +1179,10 @@ fn download_destination(url: &Url) -> PathBuf {
     path
 }
 
-/// Wire the standard behaviors onto a main-webview builder.
-fn main_webview_builder() -> WebviewBuilder<tauri::Wry> {
-    WebviewBuilder::new("main", WebviewUrl::App("index.html".into()))
+/// Wire the standard behaviors onto a connection-webview builder. Each
+/// connection gets its own view, so the label is per-connection.
+fn main_webview_builder(label: &str) -> WebviewBuilder<tauri::Wry> {
+    WebviewBuilder::new(label, WebviewUrl::App("index.html".into()))
         .initialization_script(INIT_SCRIPT)
         // External links (PRs, docs) go to the system browser.
         .on_new_window(|url, _features| {
@@ -943,7 +1302,7 @@ if (window.__kimiScrollFreeze && window.__kimiScrollFreeze.release) {
 /// Toggle the scroll freeze on the main webview ("静止" mode).
 #[tauri::command]
 fn set_scroll_freeze(app: tauri::AppHandle, frozen: bool) {
-    if let Some(wv) = app.get_webview("main") {
+    if let Some(wv) = active_view(&app) {
         let _ = wv.eval(if frozen { FREEZE_JS } else { UNFREEZE_JS });
     }
 }
@@ -951,7 +1310,7 @@ fn set_scroll_freeze(app: tauri::AppHandle, frozen: bool) {
 /// Toggle Safari Web Inspector on the main webview (memory/DOM profiling).
 #[tauri::command]
 fn toggle_devtools(app: tauri::AppHandle) {
-    if let Some(wv) = app.get_webview("main") {
+    if let Some(wv) = active_view(&app) {
         if wv.is_devtools_open() {
             wv.close_devtools();
         } else {
@@ -972,12 +1331,206 @@ fn toggle_devtools(app: tauri::AppHandle) {
     }
 }
 
+/// Status-bar data for the ACTIVE connection, fetched server-side.
+///
+/// The status page cannot fetch the daemon itself: its own document origin is
+/// `tauri://localhost`, which the daemon's origin check rejects for anything
+/// not same-origin (a remote daemon is a different origin by definition).
+/// Proxying through Rust also keeps the token out of the webview.
+/// Returns the payloads the page needs: meta, the session list, and the chosen
+/// session's status.
+#[tauri::command]
+fn daemon_snapshot(app: tauri::AppHandle) -> Value {
+    let Some(state) = daemon_state(&app) else {
+        return serde_json::json!({ "state": "down", "error": "daemon 尚未就绪" });
+    };
+    let (base, token) = (state.base.clone(), state.token.clone());
+    let meta = match http_get_json(&base, "/api/v1/meta", &token) {
+        Ok(m) => m,
+        Err(e) => return serde_json::json!({ "state": "down", "error": e }),
+    };
+    let version = meta["data"]["server_version"].clone();
+    let sessions = match http_get_json(&base, "/api/v1/sessions?page_size=50", &token) {
+        Ok(v) => v,
+        Err(e) => return serde_json::json!({ "state": "down", "error": e, "version": version }),
+    };
+    let Some(items) = sessions["data"]["items"].as_array() else {
+        return serde_json::json!({ "state": "broken" });
+    };
+    // Same pick rule the page used: first busy session, else first live one.
+    let pick = items
+        .iter()
+        .find(|s| s["busy"].as_bool().unwrap_or(false))
+        .or_else(|| items.iter().find(|s| !s["archived"].as_bool().unwrap_or(false)));
+    let Some(pick) = pick else {
+        return serde_json::json!({
+            "state": "ok",
+            "version": version,
+            "session": Value::Null,
+            "status": Value::Null,
+        });
+    };
+    let id = pick["id"].as_str().unwrap_or_default();
+    let status = http_get_json(&base, &format!("/api/v1/sessions/{id}/status"), &token)
+        .unwrap_or(Value::Null);
+    serde_json::json!({
+        "state": "ok",
+        "version": version,
+        "session": pick,
+        "status": status["data"].clone(),
+    })
+}
+
 /// The status webview asks for daemon connection details once it boots.
 #[tauri::command]
 fn daemon_info(state: tauri::State<'_, SharedDaemon>) -> Result<Value, String> {
     let guard = state.lock().map_err(|e| e.to_string())?;
     let s = guard.as_ref().ok_or_else(|| "daemon 尚未就绪".to_string())?;
     Ok(serde_json::json!({ "base": s.base, "token": s.token }))
+}
+
+/// Restart the local daemon on its current port with the installed CLI.
+/// Only meaningful for the shell's own loopback daemon: remote daemons are
+/// someone else's machine, and a non-loopback bind disables `/shutdown`.
+#[tauri::command]
+fn restart_daemon(app: tauri::AppHandle) -> Result<Value, String> {
+    let launch = daemon_state(&app).ok_or("daemon 尚未连接")?;
+    let addr = current_addr(&launch.base).ok_or("daemon 地址无法解析")?;
+    if !is_loopback_host(&addr.host) {
+        return Err("只能重启本地 daemon（当前是远程连接）".to_string());
+    }
+    let next = restart_daemon_at(&launch.base, &launch.token, &addr)?;
+    if let Some(state) = app.try_state::<SharedDaemon>() {
+        if let Ok(mut guard) = state.lock() {
+            *guard = Some(DaemonState {
+                base: next.base.clone(),
+                token: next.token.clone(),
+            });
+        }
+    }
+    // Point the active view at the fresh daemon.
+    let url = custom_ui_url(&next.base, &next.token).unwrap_or(next.url.clone());
+    if let Some(wv) = active_view(&app) {
+        let _ = wv.navigate(url);
+    }
+    Ok(serde_json::json!({ "ok": true, "base": next.base }))
+}
+
+// ---------------------------------------------------------------------------
+// Connection commands (the tab bar's backend).
+// ---------------------------------------------------------------------------
+
+/// Every connection plus which one is active.
+#[tauri::command]
+fn list_connections(app: tauri::AppHandle) -> Value {
+    let conns = app
+        .try_state::<SharedConnections>()
+        .and_then(|s| s.lock().ok().map(|g| {
+            g.iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "name": c.name,
+                        "kind": match c.kind { ConnKind::Local => "local", ConnKind::Remote => "remote" },
+                        "base": c.base,
+                    })
+                })
+                .collect::<Vec<_>>()
+        }))
+        .unwrap_or_default();
+    let active = app
+        .try_state::<SharedActive>()
+        .and_then(|s| s.lock().ok().and_then(|g| g.clone()));
+    serde_json::json!({ "connections": conns, "active": active })
+}
+
+/// Reachability of a connection's daemon, probed server-side so the page never
+/// needs cross-origin fetch. Also returns the daemon's reported version.
+#[tauri::command]
+fn connection_status(app: tauri::AppHandle, id: String) -> Value {
+    let Some(conn) = find_connection(&app, &id) else {
+        return serde_json::json!({ "ok": false, "error": "连接不存在" });
+    };
+    let Some(addr) = current_addr(&conn.base) else {
+        return serde_json::json!({ "ok": false, "error": "地址无效" });
+    };
+    match daemon_meta(&addr, &conn.token) {
+        Ok(meta) => serde_json::json!({
+            "ok": true,
+            "version": meta["data"]["server_version"].as_str().unwrap_or(""),
+        }),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }),
+    }
+}
+
+/// Add a remote daemon and open a tab for it.
+#[tauri::command]
+fn add_remote_connection(
+    app: tauri::AppHandle,
+    name: String,
+    address: String,
+    token: String,
+) -> Result<Value, String> {
+    let conn = parse_remote_connection(&name, &address, &token)?;
+    // Probe before accepting: a bad address or token should fail here with a
+    // clear message rather than as a blank tab.
+    let addr = current_addr(&conn.base).ok_or("地址无效")?;
+    daemon_meta(&addr, &conn.token)
+        .map_err(|e| format!("无法连接 {}({e})", conn.base))?;
+
+    if let Some(state) = app.try_state::<SharedConnections>() {
+        let mut guard = state.lock().map_err(|e| e.to_string())?;
+        if guard.iter().any(|c| c.id == conn.id) {
+            return Err("该地址已添加".to_string());
+        }
+        guard.push(conn.clone());
+        save_connections(&guard);
+    }
+    open_connection(&app, &conn)?;
+    activate_connection(&app, &conn.id);
+    Ok(serde_json::json!({ "ok": true, "id": conn.id }))
+}
+
+/// Close a tab. The local connection cannot be removed.
+#[tauri::command]
+fn remove_connection(app: tauri::AppHandle, id: String) -> Result<Value, String> {
+    if id == "local" {
+        return Err("本地连接不能删除".to_string());
+    }
+    let was_active = app
+        .try_state::<SharedActive>()
+        .and_then(|s| s.lock().ok().and_then(|g| g.clone()))
+        .as_deref()
+        == Some(id.as_str());
+    if let Some(wv) = app.get_webview(&view_label(&id)) {
+        let _ = wv.close();
+    }
+    if let Some(state) = app.try_state::<SharedConnections>() {
+        let mut guard = state.lock().map_err(|e| e.to_string())?;
+        guard.retain(|c| c.id != id);
+        save_connections(&guard);
+    }
+    if was_active {
+        activate_connection(&app, "local");
+    } else {
+        refresh_tabs(&app);
+    }
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Switch the visible tab.
+#[tauri::command]
+fn switch_connection(app: tauri::AppHandle, id: String) -> Result<Value, String> {
+    if find_connection(&app, &id).is_none() {
+        return Err("连接不存在".to_string());
+    }
+    activate_connection(&app, &id);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// True for hosts that mean "this machine".
+fn is_loopback_host(host: &str) -> bool {
+    host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
 }
 
 /// Open/close an overlay card in the status webview ("none" collapses;
@@ -990,33 +1543,229 @@ fn set_overlay(app: tauri::AppHandle, mode: String) {
     layout_strip(&app);
 }
 
-/// Recompute the webviews' bounds. The main webview never moves; the status
-/// webview slides between the collapsed strip and the overlay height.
+/// Recompute every view's bounds. The tab bar and status strip are pinned to
+/// the window edges; connection views share the space between them and only
+/// the active one is visible (hidden views keep their page alive).
 fn layout_strip(app: &tauri::AppHandle) {
     let Some(window) = app.get_window("main") else { return };
-    let (Some(main_wv), Some(status_wv)) = (app.get_webview("main"), app.get_webview("status"))
-    else {
-        return;
-    };
     let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) else { return };
     let w = size.width as f64 / scale;
     let h = size.height as f64 / scale;
+
+    let content_y = TABBAR_H;
+    let content_h = (h - TABBAR_H - STRIP).max(200.0);
+
+    if let Some(tabbar) = app.get_webview("tabbar") {
+        let _ = tabbar.set_position(LogicalPosition::new(0.0, 0.0));
+        let _ = tabbar.set_size(LogicalSize::new(w, TABBAR_H));
+    }
+    // Every connection view gets the full content rect; visibility decides
+    // which one is on screen, so switching needs no resize.
+    if let Ok(conns) = app.state::<SharedConnections>().lock() {
+        for conn in conns.iter() {
+            if let Some(wv) = app.get_webview(&view_label(&conn.id)) {
+                let _ = wv.set_position(LogicalPosition::new(0.0, content_y));
+                let _ = wv.set_size(LogicalSize::new(w, content_h));
+            }
+        }
+    }
     let overlay = OVERLAY_OPEN.load(Ordering::Relaxed);
     let status_h = if overlay { OVERLAY_H } else { STRIP };
-    let _ = main_wv.set_size(LogicalSize::new(w, (h - STRIP).max(240.0)));
-    let _ = status_wv.set_position(LogicalPosition::new(0.0, h - status_h));
-    let _ = status_wv.set_size(LogicalSize::new(w, status_h));
+    if let Some(status_wv) = app.get_webview("status") {
+        let _ = status_wv.set_position(LogicalPosition::new(0.0, h - status_h));
+        let _ = status_wv.set_size(LogicalSize::new(w, status_h));
+    }
+}
+
+/// The webview showing the active connection's official UI, if any.
+fn active_view(app: &tauri::AppHandle) -> Option<tauri::Webview> {
+    let id = app
+        .try_state::<SharedActive>()?
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())?;
+    app.get_webview(&view_label(&id))
+}
+
+/// The connection with `id`, cloned out of state.
+fn find_connection(app: &tauri::AppHandle, id: &str) -> Option<Connection> {
+    app.try_state::<SharedConnections>()?
+        .lock()
+        .ok()?
+        .iter()
+        .find(|c| c.id == id)
+        .cloned()
+}
+
+/// Create the webview for a connection if it does not exist yet. The view is
+/// created hidden; `activate_connection` decides what is on screen.
+fn ensure_view(app: &tauri::AppHandle, conn: &Connection) -> Result<tauri::Webview, String> {
+    let label = view_label(&conn.id);
+    if let Some(wv) = app.get_webview(&label) {
+        return Ok(wv);
+    }
+    let window = app.get_window("main").ok_or("主窗口不存在")?;
+    let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) else {
+        return Err("无法读取窗口尺寸".to_string());
+    };
+    let (w, h) = (size.width as f64 / scale, size.height as f64 / scale);
+    let content_h = (h - TABBAR_H - STRIP).max(200.0);
+
+    let mut builder = main_webview_builder(&label);
+    // Remote daemons on plain http over a LAN need ATS to allow local
+    // networking (Info.plist grants this) and their document origin must be
+    // covered by a runtime capability for script IPC (see grant_remote_capability).
+    if conn.kind == ConnKind::Remote {
+        builder = builder.incognito(false);
+    }
+    window
+        .add_child(
+            builder,
+            LogicalPosition::new(0.0, TABBAR_H),
+            LogicalSize::new(w, content_h),
+        )
+        .map_err(|e| format!("创建视图失败：{e}"))
+}
+
+/// Point a connection's view at its URL and make sure the page knows which
+/// daemon it is talking to.
+fn open_connection(app: &tauri::AppHandle, conn: &Connection) -> Result<(), String> {
+    if conn.kind == ConnKind::Remote {
+        grant_remote_capability(app, &conn.base)?;
+    }
+    // Register (or refresh) the connection so the tab bar and every lookup by
+    // id see it. The local entry is re-derived on each launch, so this
+    // replaces rather than duplicates it.
+    if let Some(state) = app.try_state::<SharedConnections>() {
+        let mut guard = state.lock().map_err(|e| e.to_string())?;
+        match guard.iter_mut().find(|c| c.id == conn.id) {
+            Some(existing) => *existing = conn.clone(),
+            None => guard.push(conn.clone()),
+        }
+    }
+    let wv = ensure_view(app, conn)?;
+    // Local daemons may not have a token yet (error page path).
+    if conn.base.is_empty() {
+        return Ok(());
+    }
+    let url = connection_url(conn);
+    wv.navigate(url).map_err(|e| format!("导航失败：{e}"))
+}
+
+/// Activate a connection: show its view, update the active daemon, refresh the
+/// window title, sessions menu and tab bar.
+fn activate_connection(app: &tauri::AppHandle, id: &str) {
+    if let Some(state) = app.try_state::<SharedActive>() {
+        if let Ok(mut guard) = state.lock() {
+            *guard = Some(id.to_string());
+        }
+    }
+    if let Some(conn) = find_connection(app, id) {
+        if let Some(state) = app.try_state::<SharedDaemon>() {
+            if let Ok(mut guard) = state.lock() {
+                *guard = Some(DaemonState {
+                    base: conn.base.clone(),
+                    token: conn.token.clone(),
+                });
+            }
+        }
+    }
+    sync_view_visibility(app);
+    layout_strip(app);
+    let app2 = app.clone();
+    thread::spawn(move || sync_sessions_and_title(&app2));
+    refresh_tabs(app);
+    // The status page follows the active connection too.
+    if let Some(status) = app.get_webview("status") {
+        let _ = status.eval("window.__kimiConnChanged && window.__kimiConnChanged()");
+    }
+}
+
+/// Rebuild the tab bar's contents.
+fn refresh_tabs(app: &tauri::AppHandle) {
+    let Some(tabs) = app.get_webview("tabbar") else { return };
+    let payload = serde_json::json!({
+        "connections": app
+            .try_state::<SharedConnections>()
+            .and_then(|s| s.lock().ok().map(|g| {
+                g.iter()
+                    .map(|c| serde_json::json!({
+                        "id": c.id,
+                        "name": c.name,
+                        "kind": match c.kind { ConnKind::Local => "local", ConnKind::Remote => "remote" },
+                    }))
+                    .collect::<Vec<_>>()
+            }))
+            .unwrap_or_default(),
+        "active": app
+            .try_state::<SharedActive>()
+            .and_then(|s| s.lock().ok().and_then(|g| g.clone())),
+    });
+    let _ = tabs.eval(&format!(
+        "window.__kimiTabs && window.__kimiTabs({payload})"
+    ));
+}
+
+/// Register a runtime capability so a remote daemon's page may call the
+/// shell's desktop-bridge commands. Capabilities are matched by document
+/// origin, and the built-in one only covers loopback — without this, every
+/// `invoke` from a LAN-hosted page is silently denied. (The `dynamic-acl`
+/// tauri feature, enabled in Cargo.toml, provides `add_capability`.)
+fn grant_remote_capability(app: &tauri::AppHandle, base: &str) -> Result<(), String> {
+    use tauri::ipc::CapabilityBuilder;
+    use tauri::Manager as _;
+    let origin = base.trim_end_matches('/');
+    let identifier = format!("remote-{}", origin.replace([':', '/', '.'], "-"));
+    let capability = CapabilityBuilder::new(identifier)
+        .remote(origin.to_string())
+        .window("main")
+        .permission("core:window:allow-start-dragging")
+        .permission("core:window:allow-internal-toggle-maximize")
+        .permission("notification:default")
+        .permission("allow-notify")
+        .permission("allow-focus-window")
+        .permission("allow-toggle-maximize")
+        .permission("allow-set-active-session");
+    app.add_capability(capability)
+        .map_err(|e| format!("授权远程页面失败：{e}"))
+}
+
+
+/// Show exactly one connection view and hide the rest.
+fn sync_view_visibility(app: &tauri::AppHandle) {
+    let active = app
+        .try_state::<SharedActive>()
+        .and_then(|s| s.lock().ok().and_then(|g| g.clone()));
+    let conns: Vec<String> = app
+        .try_state::<SharedConnections>()
+        .and_then(|s| s.lock().ok().map(|g| g.iter().map(|c| c.id.clone()).collect()))
+        .unwrap_or_default();
+    for id in conns {
+        if let Some(wv) = app.get_webview(&view_label(&id)) {
+            if Some(&id) == active.as_ref() {
+                let _ = wv.show();
+                let _ = wv.set_focus();
+            } else {
+                let _ = wv.hide();
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Update check + in-app auto-update (macOS).
+// Update check + in-app auto-update.
 //
-// The repo is public: checks prefer `gh` (auth, avoids API rate limits) and
-// fall back to anonymous curl. Downloads are anonymous curl from the release
-// CDN, verified against the asset's sha256 digest from the same API
-// response. The installer swaps the RUNNING app bundle in place with
-// same-volume renames and relaunches via a detached helper. Windows keeps
-// the badge -> browser flow (a running exe cannot replace itself).
+// Two layers, deliberately:
+//   - THIS module answers "is there a newer release, and what does it say?"
+//     for the status card's badge, notes and "前往下载" link. It reads the
+//     GitHub releases API (gh when available for auth/rate limits, anonymous
+//     curl otherwise) purely for display.
+//   - The actual download/verify/install is the official
+//     `tauri-plugin-updater`'s job (see auto_update_pipeline): it reads the
+//     signed `latest.json` manifest configured in tauri.conf.json, verifies
+//     the minisign signature, installs the bundle and relaunches. That is
+//     stricter than the shell-out this replaced, which only compared a
+//     sha256 digest and then swapped the .app by hand.
 //
 // Test hooks: KIMI_UI_FORCE_UPDATE=1 always reports has_update;
 // KIMI_UI_UPDATE_TAG=<tag> targets a specific release instead of latest.
@@ -1030,10 +1779,11 @@ struct UpdateInfo {
     has_update: bool,
     /// Release notes (markdown), rendered by the status page's update card.
     notes: String,
-    /// macOS zip asset for auto-update (empty when absent).
+    /// macOS zip asset, used only for the "前往下载" fallback link.
     asset_url: String,
     asset_size: u64,
-    /// "sha256:<hex>" from the release API (empty when absent).
+    /// "sha256:<hex>" from the release API (informational; the updater plugin
+    /// verifies minisign signatures instead).
     asset_digest: String,
     /// Auto-update only exists on macOS.
     can_auto_update: bool,
@@ -1066,6 +1816,17 @@ fn version_newer(latest: &str, current: &str) -> bool {
     }
     parts(latest) > parts(current)
 }
+
+/// Session the SPA is currently viewing, from its URL route.
+static ACTIVE_SESSION: Mutex<Option<String>> = Mutex::new(None);
+/// Ordered (id, title) pairs of recent non-archived sessions (API order).
+static SESSION_TITLES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// How many recent sessions the 会话 menu shows.
+const MENU_SESSIONS: usize = 8;
+
+/// Last session list the menu was built from; skip rebuilds when unchanged.
+static MENU_BUILT: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// The macOS release asset this updater downloads.
 const MACOS_ASSET: &str = "kimi-ui-macos-arm64.zip";
@@ -1155,8 +1916,6 @@ static UPDATE_PROGRESS: Mutex<UpdateProgress> = Mutex::new(UpdateProgress {
     message: String::new(),
 });
 static AUTO_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
-/// Extracted new app from a completed download, consumed by install.
-static STAGED_APP: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn set_progress(phase: &'static str, pct: u32, message: String) {
     if let Ok(mut guard) = UPDATE_PROGRESS.lock() {
@@ -1164,197 +1923,71 @@ fn set_progress(phase: &'static str, pct: u32, message: String) {
     }
 }
 
-/// sha256 hex digest of a file via `shasum -a 256`.
-fn file_sha256(path: &Path) -> Result<String, String> {
-    let shasum = find_executable("shasum").ok_or("找不到 shasum")?;
-    let out = no_console(Command::new(shasum))
-        .args(["-a", "256"])
-        .arg(path)
-        .output()
-        .map_err(|e| format!("计算校验值失败：{e}"))?;
-    if !out.status.success() {
-        return Err("shasum 执行失败".to_string());
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.split_whitespace()
-        .next()
-        .map(|h| h.to_lowercase())
-        .ok_or_else(|| "shasum 输出为空".to_string())
-}
+/// Plugin-driven update pipeline.
+///
+/// The heavy lifting (signed manifest fetch, download, minisign verification,
+/// bundle install) is the official `tauri-plugin-updater`'s job — it is
+/// stricter than a hand-rolled shell-out (signature check instead of only a
+/// digest) and it resolves the platform artifact from `latest.json`. We keep
+/// the status card's contract by translating its progress events into
+/// `UPDATE_PROGRESS`.
+///
+/// Note there is no separate "install" step any more: the plugin verifies and
+/// installs in one call, so `start` runs the whole thing and then relaunches.
+#[cfg(desktop)]
+fn auto_update_pipeline(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt as _;
 
-/// Compare a "sha256:<hex>" API digest with a local file's digest.
-fn digest_matches(api_digest: &str, actual_hex: &str) -> bool {
-    let expected = api_digest
-        .trim()
-        .trim_start_matches("sha256:")
-        .to_lowercase();
-    !expected.is_empty() && expected == actual_hex.to_lowercase()
-}
+    // Deliberately keeps the system HTTP proxy: with a VPN/Clash setup the
+    // proxy is what makes github.com reachable. (A local http test endpoint
+    // would be swallowed by it — smoke tests set NO_PROXY for that.)
+    let updater = app
+        .updater()
+        .map_err(|e| format!("更新器不可用：{e}"))?;
 
-/// The app bundle currently running (…/Kimi Code.app from the exe path).
-#[cfg(target_os = "macos")]
-fn current_app_bundle() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    // exe -> MacOS -> Contents -> <App>.app
-    exe.ancestors().nth(3).map(Path::to_path_buf)
-}
+    let update = tauri::async_runtime::block_on(updater.check())
+        .map_err(|e| format!("检查更新失败：{e:?}"))?
+        .ok_or("已是最新版本".to_string())?;
 
-/// Download, verify and stage the new bundle (background thread body).
-fn auto_update_pipeline() -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Err("自动更新目前仅支持 macOS，请前往下载".to_string());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let Some(info) = UPDATE_INFO.lock().ok().and_then(|g| g.clone()) else {
-            return Err("尚未获取到版本信息".to_string());
-        };
-        if info.asset_url.is_empty() || info.asset_digest.is_empty() {
-            return Err("版本信息缺少下载资产".to_string());
-        }
+    let version = update.version.clone();
+    set_progress("downloading", 0, String::new());
+    tauri::async_runtime::block_on(update.download_and_install(
+        |downloaded, total| {
+            let pct = match total {
+                Some(t) if t > 0 => ((downloaded as f64 / t as f64) * 100.0).min(99.0) as u32,
+                _ => 0,
+            };
+            set_progress("downloading", pct, String::new());
+        },
+        || {
+            // Emitted once the payload is verified and about to be installed.
+            set_progress("verifying", 100, "校验中…".to_string());
+        },
+    ))
+    .map_err(|e| format!("安装失败：{e}"))?;
 
-        let work = std::env::temp_dir().join(format!("kimi-ui-update-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&work);
-        fs::create_dir_all(&work).map_err(|e| format!("创建临时目录失败：{e}"))?;
-        let zip = work.join("bundle.zip");
-
-        // Download with curl; progress is derived by polling the file size.
-        set_progress("downloading", 0, String::new());
-        let curl = find_executable("curl").ok_or("找不到 curl")?;
-        let mut child = no_console(Command::new(curl))
-            .args(["-L", "--fail", "--silent", "--show-error", "-o"])
-            .arg(&zip)
-            .arg(&info.asset_url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("启动 curl 失败：{e}"))?;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        let err = child
-                            .stderr
-                            .take()
-                            .and_then(|mut s| {
-                                use std::io::Read as _;
-                                let mut buf = String::new();
-                                s.read_to_string(&mut buf).ok().map(|_| buf)
-                            })
-                            .unwrap_or_default();
-                        let tail = truncate_chars(err.trim(), 200);
-                        return Err(format!("下载失败：{tail}"));
-                    }
-                    break;
-                }
-                Ok(None) => {
-                    let done = fs::metadata(&zip).map(|m| m.len()).unwrap_or(0);
-                    let pct = if info.asset_size > 0 {
-                        ((done as f64 / info.asset_size as f64) * 100.0).min(99.0) as u32
-                    } else {
-                        0
-                    };
-                    set_progress("downloading", pct, String::new());
-                    thread::sleep(Duration::from_millis(400));
-                }
-                Err(e) => return Err(format!("等待下载失败：{e}")),
-            }
-        }
-
-        // Verify against the API digest before touching anything else.
-        set_progress("verifying", 100, "校验中…".to_string());
-        let actual = file_sha256(&zip)?;
-        if !digest_matches(&info.asset_digest, &actual) {
-            return Err("校验失败：下载内容与官方发布不一致".to_string());
-        }
-
-        // Extract and stage. ditto is the counterpart of the CI packager and
-        // preserves resource forks / permissions that plain unzip drops.
-        let ditto = find_executable("ditto").ok_or("找不到 ditto")?;
-        let out = no_console(Command::new(ditto))
-            .args(["-x", "-k"])
-            .arg(&zip)
-            .arg(&work)
-            .output()
-            .map_err(|e| format!("启动 ditto 失败：{e}"))?;
-        if !out.status.success() {
-            return Err("解包失败".to_string());
-        }
-        let new_app = work.join("Kimi Code.app");
-        if !new_app.is_dir() {
-            return Err("解包后未找到 Kimi Code.app".to_string());
-        }
-        // Defensive: curl downloads carry no quarantine bit, strip anyway so
-        // Gatekeeper never blocks the ad-hoc-signed bundle.
-        let _ = no_console(Command::new("xattr"))
-            .args(["-dr", "com.apple.quarantine"])
-            .arg(&new_app)
-            .output();
-        if let Ok(mut guard) = STAGED_APP.lock() {
-            *guard = Some(new_app);
-        }
-        set_progress("ready", 100, format!("v{} 已就绪", info.latest));
-        Ok(())
-    }
-}
-
-/// Swap the staged bundle in place of the running app, then relaunch.
-/// Same-volume renames keep each step atomic; a failed placement rolls back.
-#[cfg(target_os = "macos")]
-fn auto_update_install_mac(app: &tauri::AppHandle) -> Result<(), String> {
-    let staged = STAGED_APP
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .ok_or("尚未下载完成".to_string())?;
-    let bundle = current_app_bundle().ok_or("无法定位当前应用位置")?;
-    let parent = bundle
-        .parent()
-        .ok_or("无法定位应用所在目录")?
-        .to_path_buf();
-    let file_name = bundle
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("应用目录名无效")?
-        .to_string();
-    let old = parent.join(format!(".{file_name}.old-{}", std::process::id()));
-
-    // 1. move the running bundle aside (the process keeps its inodes).
-    fs::rename(&bundle, &old).map_err(|e| {
-        format!("无法移动当前应用（目录可能无写权限）：{e}。可手动下载更新")
-    })?;
-    // 2. move the staged bundle in; roll back on failure.
-    if fs::rename(&staged, &bundle).is_err() {
-        let _ = fs::rename(&old, &bundle);
-        return Err("放置新版本失败，已回滚".to_string());
-    }
-    // 3. detached helper: relaunch the new app, then clean the old bundle
-    //    and the staging dir (zip + extracted copy).
-    let work_dir = staged.parent().map(Path::to_path_buf);
-    let script = "sleep 1; open \"$1\"; sleep 3; rm -rf \"$2\" \"$3\"";
-    let _ = no_console(Command::new("sh"))
-        .arg("-c")
-        .arg(script)
-        .arg("sh")
-        .arg(&bundle)
-        .arg(&old)
-        .arg(work_dir.unwrap_or_else(|| PathBuf::from("/dev/null")))
-        .spawn();
-    // 4. exit through the normal path so spawned children are reaped.
-    app.exit(0);
+    set_progress("ready", 100, format!("v{version} 已就绪"));
     Ok(())
 }
 
+#[cfg(not(desktop))]
+fn auto_update_pipeline(_app: &tauri::AppHandle) -> Result<(), String> {
+    Err("自动更新目前仅支持桌面平台".to_string())
+}
+
 /// Status-bar entry point: "start" | "install" | "status".
+///
+/// "start" performs the whole download+verify+install (the plugin does those
+/// in one call); "install" simply relaunches, which is what the card's
+/// "安装并重启" button means once the payload is staged.
 #[tauri::command]
 fn auto_update(app: tauri::AppHandle, action: String) -> Value {
     match action.as_str() {
         "start" => {
             if !AUTO_UPDATE_RUNNING.swap(true, Ordering::Relaxed) {
+                let app2 = app.clone();
                 thread::spawn(move || {
-                    if let Err(e) = auto_update_pipeline() {
+                    if let Err(e) = auto_update_pipeline(&app2) {
                         eprintln!("kimi-ui: 自动更新失败：{e}");
                         set_progress("error", 0, e);
                     }
@@ -1364,20 +1997,9 @@ fn auto_update(app: tauri::AppHandle, action: String) -> Value {
             serde_json::json!({})
         }
         "install" => {
-            #[cfg(target_os = "macos")]
-            {
-                match auto_update_install_mac(&app) {
-                    Ok(()) => serde_json::json!({ "ok": true }),
-                    Err(e) => {
-                        set_progress("error", 0, e.clone());
-                        serde_json::json!({ "ok": false, "error": e })
-                    }
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                serde_json::json!({ "ok": false, "error": "自动更新目前仅支持 macOS".to_string() })
-            }
+            // The plugin already installed the verified payload; restart into
+            // it (re-execs the replaced bundle).
+            app.restart();
         }
         _ => {
             let snapshot = UPDATE_PROGRESS.lock().map(|g| g.clone()).unwrap_or(UpdateProgress {
@@ -1389,133 +2011,6 @@ fn auto_update(app: tauri::AppHandle, action: String) -> Value {
         }
     }
 }
-
-#[tauri::command]
-fn open_url(url: String) {
-    if let Ok(u) = url.parse::<Url>() {
-        open_in_system_browser(&u);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Active session & window title.
-//
-// The injected script reports the SPA's route (`/sessions/<id>` or the
-// new-session root) via `set_active_session`. A 30s refresher keeps an ordered
-// (id, title) list from `GET /api/v1/sessions` which feeds both the window
-// title — visible in Cmd-Tab / Mission Control even though the title bar text
-// itself is hidden — and the dynamic 会话 (recent sessions) menu.
-// ---------------------------------------------------------------------------
-
-/// Session the SPA is currently viewing, from its URL route.
-static ACTIVE_SESSION: Mutex<Option<String>> = Mutex::new(None);
-/// Ordered (id, title) pairs of recent non-archived sessions (API order).
-static SESSION_TITLES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
-
-/// How many recent sessions the 会话 menu shows.
-const MENU_SESSIONS: usize = 8;
-
-fn daemon_state(app: &tauri::AppHandle) -> Option<DaemonState> {
-    app.try_state::<SharedDaemon>()
-        .and_then(|s| s.lock().ok().and_then(|g| g.clone()))
-}
-
-/// Recent non-archived sessions as ordered (id, title) pairs.
-fn fetch_sessions(daemon: &DaemonState) -> Result<Vec<(String, String)>, String> {
-    let v = http_get_json(&daemon.base, "/api/v1/sessions?page_size=50", &daemon.token)?;
-    parse_sessions(&v).ok_or_else(|| "会话列表结构可能已变化".to_string())
-}
-
-/// `(id, title)` pairs from a `GET /api/v1/sessions` payload; None when the
-/// envelope shape drifted.
-fn parse_sessions(v: &Value) -> Option<Vec<(String, String)>> {
-    let items = v["data"]["items"].as_array()?;
-    Some(
-        items
-            .iter()
-            .filter(|s| !s["archived"].as_bool().unwrap_or(false))
-            .filter_map(|s| {
-                let id = s["id"].as_str()?.to_string();
-                let title = s["title"]
-                    .as_str()
-                    .filter(|t| !t.trim().is_empty())
-                    .unwrap_or("未命名会话");
-                Some((id, title.to_string()))
-            })
-            .collect(),
-    )
-}
-
-/// Truncate on char boundaries so CJK titles never panic mid-codepoint.
-fn truncate_chars(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
-}
-
-/// "<session title> — Kimi Code", or the plain app name without one.
-fn window_title_text() -> String {
-    let Some(id) = ACTIVE_SESSION.lock().ok().and_then(|g| g.clone()) else {
-        return "Kimi Code".to_string();
-    };
-    SESSION_TITLES
-        .lock()
-        .ok()
-        .and_then(|g| {
-            g.iter()
-                .find(|(sid, _)| *sid == id)
-                .map(|(_, title)| format!("{} — Kimi Code", truncate_chars(title, 60)))
-        })
-        .unwrap_or_else(|| "Kimi Code".to_string())
-}
-
-fn refresh_window_title(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_window("main") {
-        let title = window_title_text();
-        let _ = window.set_title(&title);
-    }
-}
-
-/// Fetch the session list once, then update the title and menu. Cheap
-/// loopback call, so running it on every route change is fine.
-fn sync_sessions_and_title(app: &tauri::AppHandle) {
-    if let Some(daemon) = daemon_state(app) {
-        if let Ok(sessions) = fetch_sessions(&daemon) {
-            if let Ok(mut guard) = SESSION_TITLES.lock() {
-                *guard = sessions;
-            }
-        }
-    }
-    refresh_window_title(app);
-    refresh_sessions_menu(app);
-}
-
-/// Called by the injected script whenever the SPA's route changes.
-#[tauri::command]
-fn set_active_session(app: tauri::AppHandle, id: Option<String>) {
-    if let Ok(mut guard) = ACTIVE_SESSION.lock() {
-        *guard = id;
-    }
-    let app = app.clone();
-    thread::spawn(move || sync_sessions_and_title(&app));
-}
-
-fn start_sessions_refresher(app: tauri::AppHandle) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(30));
-        sync_sessions_and_title(&app);
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Native menu bar.
-//
-// macOS top level must be submenus only. The 会话 submenu is rebuilt
-// wholesale (app.set_menu) whenever the recent-session list changes — menu
-// types are not storable off the main thread, and full rebuilds are rare
-// because they are skipped when the list did not change.
-// ---------------------------------------------------------------------------
-
-/// Last session list the menu was built from; skip rebuilds when unchanged.
-static MENU_BUILT: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 fn build_app_menu(
     app: &tauri::AppHandle,
@@ -1598,39 +2093,12 @@ fn build_app_menu(
     Ok(())
 }
 
-/// Rebuild the menu when the recent-sessions list changed. Runs the build on
-/// the main thread — NSApplication's main menu must only be touched there.
-fn refresh_sessions_menu(app: &tauri::AppHandle) {
-    let sessions: Vec<(String, String)> = SESSION_TITLES
-        .lock()
-        .map(|g| {
-            g.iter()
-                .take(MENU_SESSIONS)
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let unchanged = MENU_BUILT
-        .lock()
-        .map(|built| *built == sessions)
-        .unwrap_or(false);
-    if unchanged {
-        return;
-    }
-    if let Ok(mut built) = MENU_BUILT.lock() {
-        *built = sessions.clone();
-    }
-    let app2 = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Err(e) = build_app_menu(&app2, &sessions) {
-            eprintln!("kimi-ui: 重建菜单失败：{e}");
-        }
-    });
+
+fn daemon_state(app: &tauri::AppHandle) -> Option<DaemonState> {
+    app.try_state::<SharedDaemon>()
+        .and_then(|s| s.lock().ok().and_then(|g| g.clone()))
 }
 
-/// In-page SPA navigation: calling the SPA's own wrapped history.pushState
-/// (our document-start wrapper sits beneath it) makes the router react
-/// without a reload; the catch fallback covers a not-yet-booted page.
 fn eval_main_navigation(app: &tauri::AppHandle, path: &str) {
     if let Some(wv) = app.get_webview("main") {
         let path_json = serde_json::json!(path).to_string();
@@ -1640,8 +2108,11 @@ fn eval_main_navigation(app: &tauri::AppHandle, path: &str) {
     }
 }
 
-/// Menu-bar actions. Registered once in setup; `event.id()` is the
-/// MenuItem id we assigned (or "open-session:<id>").
+fn fetch_sessions(daemon: &DaemonState) -> Result<Vec<(String, String)>, String> {
+    let v = http_get_json(&daemon.base, "/api/v1/sessions?page_size=50", &daemon.token)?;
+    parse_sessions(&v).ok_or_else(|| "会话列表结构可能已变化".to_string())
+}
+
 fn handle_menu_event(app: &tauri::AppHandle, event: &tauri::menu::MenuEvent) {
     let id = event.id().0.as_str();
     match id {
@@ -1689,7 +2160,8 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .manage(SharedDaemon::new(None))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             notify,
             focus_window,
@@ -1703,8 +2175,18 @@ fn main() {
             open_url,
             set_active_session,
             remote_control,
-            auto_update
+            auto_update,
+            restart_daemon,
+            list_connections,
+            connection_status,
+            add_remote_connection,
+            remove_connection,
+            switch_connection,
+            daemon_snapshot
         ])
+        .manage(SharedDaemon::new(None))
+        .manage(SharedConnections::new(Vec::new()))
+        .manage(SharedActive::new(None))
         .setup(|app| {
             let window_builder = WindowBuilder::new(app, "main")
                 .title("Kimi Code")
@@ -1720,14 +2202,16 @@ fn main() {
             let scale = window.scale_factor()?;
             let (w, h) = (size.width as f64 / scale, size.height as f64 / scale);
 
-            // Main webview: the official web UI, stops above the strip.
-            let main_wv = window.add_child(
-                main_webview_builder(),
+            // Tab bar: the shell's connection switcher, flush with the top so
+            // the macOS traffic lights sit on it (Overlay title bar).
+            let _tabbar_wv = window.add_child(
+                WebviewBuilder::new("tabbar", WebviewUrl::App("tabs.html".into()))
+                    .transparent(true),
                 LogicalPosition::new(0.0, 0.0),
-                LogicalSize::new(w, h - STRIP),
+                LogicalSize::new(w, TABBAR_H),
             )?;
             // Status webview: the shell's own UI surface (transparent so the
-            // overlay cards float over the main webview).
+            // overlay cards float over the connection views).
             let _status_wv = window.add_child(
                 WebviewBuilder::new("status", WebviewUrl::App("status.html".into()))
                     .transparent(true),
@@ -1759,25 +2243,52 @@ fn main() {
             app.on_menu_event(move |handle, event| handle_menu_event(handle, &event));
             start_sessions_refresher(app_handle);
 
+            // Restore the remote connections the user added last time.
+            for conn in load_connections() {
+                let app_handle = app.handle().clone();
+                thread::spawn(move || {
+                    if let Err(e) = open_connection(&app_handle, &conn) {
+                        eprintln!("kimi-ui: 打开远程连接失败：{e}");
+                    }
+                });
+            }
+
             let app_handle = app.handle().clone();
             thread::spawn(move || match connect_daemon() {
                 Ok(launch) => {
-                    let url = custom_ui_url(&launch.base, &launch.token)
-                        .unwrap_or(launch.url);
+                    let conn = Connection {
+                        id: "local".to_string(),
+                        name: "本地".to_string(),
+                        kind: ConnKind::Local,
+                        base: launch.base.clone(),
+                        token: launch.token.clone(),
+                    };
                     if let Some(state) = app_handle.try_state::<SharedDaemon>() {
                         *state.lock().unwrap() = Some(DaemonState {
                             base: launch.base,
                             token: launch.token,
                         });
                     }
-                    if let Err(e) = main_wv.navigate(url) {
-                        eprintln!("kimi-ui: 打开 web UI 失败：{e}");
+                    if let Err(e) = open_connection(&app_handle, &conn) {
+                        eprintln!("kimi-ui: 打开本地连接失败：{e}");
                     }
+                    activate_connection(&app_handle, "local");
                 }
                 Err(e) => {
-                    let msg = serde_json::to_string(&e)
-                        .unwrap_or_else(|_| "{\"kind\":\"unknown\"}".to_string());
-                    let _ = main_wv.eval(&format!("window.__kimiBootError({msg})"));
+                    // No daemon: still show a view so the boot guidance renders.
+                    let conn = Connection {
+                        id: "local".to_string(),
+                        name: "本地".to_string(),
+                        kind: ConnKind::Local,
+                        base: String::new(),
+                        token: String::new(),
+                    };
+                    if let Ok(wv) = ensure_view(&app_handle, &conn) {
+                        activate_connection(&app_handle, "local");
+                        let msg = serde_json::to_string(&e)
+                            .unwrap_or_else(|_| "{\"kind\":\"unknown\"}".to_string());
+                        let _ = wv.eval(&format!("window.__kimiBootError({msg})"));
+                    }
                 }
             });
             start_update_check();
@@ -1791,8 +2302,10 @@ fn main() {
             if let tauri::RunEvent::Exit = event {
                 if let Ok(mut guard) = SPAWNED_SERVER.lock() {
                     if let Some(mut child) = guard.take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        // SIGTERM so the CLI runs its own shutdown (clearing
+                        // its instance files); SIGKILL alone leaves stale
+                        // registry entries that mislead the next launch.
+                        terminate_child(&mut child, Duration::from_secs(3));
                     }
                 }
                 if let Some(mut child) = REMOTE_RC.lock().ok().and_then(|mut g| g.take()) {
@@ -1805,6 +2318,113 @@ fn main() {
                 }
             }
         });
+}
+
+#[tauri::command]
+fn open_url(url: String) {
+    if let Ok(u) = url.parse::<Url>() {
+        open_in_system_browser(&u);
+    }
+}
+
+fn parse_sessions(v: &Value) -> Option<Vec<(String, String)>> {
+    let items = v["data"]["items"].as_array()?;
+    Some(
+        items
+            .iter()
+            .filter(|s| !s["archived"].as_bool().unwrap_or(false))
+            .filter_map(|s| {
+                let id = s["id"].as_str()?.to_string();
+                let title = s["title"]
+                    .as_str()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or("未命名会话");
+                Some((id, title.to_string()))
+            })
+            .collect(),
+    )
+}
+
+fn refresh_sessions_menu(app: &tauri::AppHandle) {
+    let sessions: Vec<(String, String)> = SESSION_TITLES
+        .lock()
+        .map(|g| {
+            g.iter()
+                .take(MENU_SESSIONS)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let unchanged = MENU_BUILT
+        .lock()
+        .map(|built| *built == sessions)
+        .unwrap_or(false);
+    if unchanged {
+        return;
+    }
+    if let Ok(mut built) = MENU_BUILT.lock() {
+        *built = sessions.clone();
+    }
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Err(e) = build_app_menu(&app2, &sessions) {
+            eprintln!("kimi-ui: 重建菜单失败：{e}");
+        }
+    });
+}
+
+fn refresh_window_title(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_window("main") {
+        let title = window_title_text();
+        let _ = window.set_title(&title);
+    }
+}
+
+#[tauri::command]
+fn set_active_session(app: tauri::AppHandle, id: Option<String>) {
+    if let Ok(mut guard) = ACTIVE_SESSION.lock() {
+        *guard = id;
+    }
+    let app = app.clone();
+    thread::spawn(move || sync_sessions_and_title(&app));
+}
+
+fn start_sessions_refresher(app: tauri::AppHandle) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(30));
+        sync_sessions_and_title(&app);
+    });
+}
+
+fn sync_sessions_and_title(app: &tauri::AppHandle) {
+    if let Some(daemon) = daemon_state(app) {
+        if let Ok(sessions) = fetch_sessions(&daemon) {
+            if let Ok(mut guard) = SESSION_TITLES.lock() {
+                *guard = sessions;
+            }
+        }
+    }
+    refresh_window_title(app);
+    refresh_sessions_menu(app);
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+fn window_title_text() -> String {
+    let Some(id) = ACTIVE_SESSION.lock().ok().and_then(|g| g.clone()) else {
+        return "Kimi Code".to_string();
+    };
+    SESSION_TITLES
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.iter()
+                .find(|(sid, _)| *sid == id)
+                .map(|(_, title)| format!("{} — Kimi Code", truncate_chars(title, 60)))
+        })
+        .unwrap_or_else(|| "Kimi Code".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1820,6 +2440,9 @@ fn main() {
 /// Plan quota from `/api/v1/oauth/usage`.
 #[derive(Clone, Debug, serde::Serialize)]
 struct PlanUsage {
+    /// Daemon this reading came from (cache key).
+    #[serde(skip)]
+    base: String,
     weekly_pct: u32,
     weekly_reset_at: String,
     hourly_pct: u32,
@@ -1902,7 +2525,7 @@ fn row_is_hourly(row: &Value) -> bool {
 /// Extract (weekly pct, weekly reset, hourly pct, hourly reset) from the
 /// `/oauth/usage` data object. The weekly row may live in `summary` or in
 /// `limits[]` depending on account shape — consider both.
-fn extract_plan_usage(data: &Value) -> Result<PlanUsage, String> {
+fn extract_plan_usage(base: &str, data: &Value) -> Result<PlanUsage, String> {
     if data["kind"].as_str() == Some("error") {
         let msg = data["message"].as_str().unwrap_or("未知错误");
         return Err(format!("额度接口返回错误：{msg}"));
@@ -1918,6 +2541,7 @@ fn extract_plan_usage(data: &Value) -> Result<PlanUsage, String> {
     let hourly = rows.iter().find(|r| row_is_hourly(r) && row_pct(r).is_some());
     match (weekly, hourly) {
         (Some(w), Some(h)) => Ok(PlanUsage {
+            base: base.to_string(),
             weekly_pct: row_pct(w).unwrap_or(0),
             weekly_reset_at: row_reset_at(w),
             hourly_pct: row_pct(h).unwrap_or(0),
@@ -1935,14 +2559,20 @@ fn plan_usage(state: tauri::State<'_, SharedDaemon>) -> Value {
     let Some(daemon) = state.lock().ok().and_then(|g| g.clone()) else {
         return serde_json::json!({ "loading": true });
     };
+    // Quota is per-account, so the cache is keyed by the daemon it came from:
+    // otherwise switching tabs would show the previous connection's numbers.
     let stale = PLAN_USAGE
         .lock()
-        .map(|u| u.as_ref().map_or(true, |u| u.fetched_at + FETCH_TTL_SECS < now_secs()))
+        .map(|u| {
+            u.as_ref().map_or(true, |u| {
+                u.base != daemon.base || u.fetched_at + FETCH_TTL_SECS < now_secs()
+            })
+        })
         .unwrap_or(true);
     if stale && !FETCH_RUNNING.swap(true, Ordering::Relaxed) {
         thread::spawn(move || {
             match http_get_json(&daemon.base, "/api/v1/oauth/usage", &daemon.token)
-                .and_then(|v| extract_plan_usage(&v["data"]))
+                .and_then(|v| extract_plan_usage(&daemon.base, &v["data"]))
             {
                 Ok(u) => {
                     if let Ok(mut guard) = PLAN_USAGE.lock() {
@@ -2546,11 +3176,26 @@ mod tests {
     #[test]
     fn extracts_plan_usage_from_oauth_response() {
         let data: Value = serde_json::from_str(OAUTH_USAGE_SAMPLE).unwrap();
-        let plan = extract_plan_usage(&data).unwrap();
+        let plan = extract_plan_usage("http://127.0.0.1:1", &data).unwrap();
         assert_eq!(plan.weekly_pct, 3);
         assert_eq!(plan.hourly_pct, 4); // 7/200 rounds to 4%
         assert_eq!(plan.weekly_reset_at, "2026-08-29T13:17:18Z");
         assert_eq!(plan.hourly_reset_at, "2026-08-23T19:17:18Z");
+    }
+
+    /// The quota reading records which daemon produced it, so switching tabs
+    /// does not show the previous connection's numbers.
+    #[test]
+    fn plan_usage_records_its_source_daemon() {
+        let data: Value = serde_json::from_str(OAUTH_USAGE_SAMPLE).unwrap();
+        let a = extract_plan_usage("http://127.0.0.1:58627", &data).unwrap();
+        let b = extract_plan_usage("http://192.168.31.106:58630", &data).unwrap();
+        assert_eq!(a.base, "http://127.0.0.1:58627");
+        assert_eq!(b.base, "http://192.168.31.106:58630");
+        assert_ne!(a.base, b.base, "cache key must distinguish connections");
+        // The key is a cache detail, never sent to the page.
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(!json.contains("58627"), "base must be skipped in JSON: {json}");
     }
 
     #[test]
@@ -2561,7 +3206,7 @@ mod tests {
                           {"name":"5h limit","used":10,"limit":100}]}"#,
         )
         .unwrap();
-        let plan = extract_plan_usage(&data).unwrap();
+        let plan = extract_plan_usage("http://127.0.0.1:1", &data).unwrap();
         assert_eq!(plan.weekly_pct, 50);
         assert_eq!(plan.hourly_pct, 10);
     }
@@ -2570,13 +3215,15 @@ mod tests {
     fn oauth_usage_error_and_missing_rows_are_rejected() {
         let err: Value =
             serde_json::from_str(r#"{"kind":"error","message":"not logged in"}"#).unwrap();
-        assert!(extract_plan_usage(&err).unwrap_err().contains("not logged in"));
+        assert!(extract_plan_usage("http://127.0.0.1:1", &err)
+            .unwrap_err()
+            .contains("not logged in"));
         let partial: Value = serde_json::from_str(
             r#"{"kind":"ok","summary":null,
                 "limits":[{"window":{"duration":1,"unit":"week"},"used":1,"limit":10}]}"#,
         )
         .unwrap();
-        assert!(extract_plan_usage(&partial).is_err());
+        assert!(extract_plan_usage("http://127.0.0.1:1", &partial).is_err());
     }
 
     /// http_get_json over a real socket: request carries the bearer token,
@@ -2688,15 +3335,6 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn digests_match_with_prefix_and_case() {
-        let hex = "7960187B8E9FD9505368CF7830E8C6A84A1FAFCAFFD4CB9998344EC6BA896AE4";
-        assert!(digest_matches(&format!("sha256:{hex}"), &hex.to_lowercase()));
-        assert!(digest_matches(hex, &hex.to_lowercase()));
-        assert!(!digest_matches("sha256:deadbeef", &hex.to_lowercase()));
-        assert!(!digest_matches("", &hex.to_lowercase())); // missing digest never matches
-    }
-
     /// Real releases/latest API shape: the macOS asset must be picked out of
     /// a mixed asset list with its url/size/digest.
     #[test]
@@ -2723,5 +3361,192 @@ mod tests {
         // No macOS asset -> no UpdateInfo at all (auto-update impossible).
         let raw_no_asset = r#"{"tag_name":"v9","html_url":"u","body":"","assets":[]}"#;
         assert!(parse_release_json(raw_no_asset).is_none());
+    }
+
+    #[test]
+    fn finds_instance_pid_for_endpoint() {
+        let home = temp_home("instance-pid");
+        let (_listener, port) = live_port();
+        fs::write(
+            home.join("server/instances/a.json"),
+            format!(
+                r#"{{"server_id":"a","pid":4242,"host":"127.0.0.1","port":{port},"started_at":1,"heartbeat_at":1}}"#
+            ),
+        )
+        .unwrap();
+        let addr = DaemonAddr {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        assert_eq!(instance_pid_for(&home, &addr), Some(4242));
+
+        // A different port must not match this entry.
+        let other = DaemonAddr {
+            host: "127.0.0.1".to_string(),
+            port: dead_port(),
+        };
+        assert_eq!(instance_pid_for(&home, &other), None);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn instance_pid_reads_legacy_lock_too() {
+        let home = temp_home("instance-lock");
+        fs::remove_dir_all(home.join("server/instances")).unwrap();
+        let (_listener, port) = live_port();
+        fs::write(
+            home.join("server/lock"),
+            format!(r#"{{"pid":777,"host":"127.0.0.1","port":{port}}}"#),
+        )
+        .unwrap();
+        let addr = DaemonAddr {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        assert_eq!(instance_pid_for(&home, &addr), Some(777));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn parses_daemon_base_into_address() {
+        let addr = current_addr("http://127.0.0.1:58627").unwrap();
+        assert_eq!(addr.host, "127.0.0.1");
+        assert_eq!(addr.port, 58627);
+        let lan = current_addr("http://192.168.31.106:60001").unwrap();
+        assert_eq!(lan.host, "192.168.31.106");
+        assert_eq!(lan.port, 60001);
+        assert!(current_addr("http://127.0.0.1").is_none());
+        assert!(current_addr("http://127.0.0.1:notaport").is_none());
+    }
+
+    #[test]
+    fn recognizes_loopback_hosts() {
+        for h in ["127.0.0.1", "localhost", "::1", "[::1]"] {
+            assert!(is_loopback_host(h), "{h} should be loopback");
+        }
+        for h in ["192.168.31.106", "10.0.0.5", "0.0.0.0", "example.com"] {
+            assert!(!is_loopback_host(h), "{h} should not be loopback");
+        }
+    }
+
+    #[test]
+    fn parses_remote_connection_addresses() {
+        let c = parse_remote_connection("台式机", "192.168.31.106:58627", " tok ").unwrap();
+        assert_eq!(c.base, "http://192.168.31.106:58627");
+        assert_eq!(c.name, "台式机");
+        assert_eq!(c.id, "192.168.31.106-58627");
+        assert!(c.kind == ConnKind::Remote);
+        assert_eq!(c.token, "tok"); // trimmed
+
+        let bare = parse_remote_connection("", "10.0.0.8", "t").unwrap();
+        assert_eq!(bare.base, "http://10.0.0.8:58627");
+        assert_eq!(bare.name, "10.0.0.8:58627"); // name defaults to the address
+
+        let with_scheme = parse_remote_connection("n", "http://10.0.0.9:60001", "t").unwrap();
+        assert_eq!(with_scheme.base, "http://10.0.0.9:60001");
+
+        assert!(parse_remote_connection("n", "   ", "t").is_err());
+        assert!(parse_remote_connection("n", "http://", "t").is_err());
+    }
+
+    /// Remote views load the daemon's own UI (same-origin, so no `kimi_origin`
+    /// and no CORS entry needed on the far side); local views go through the
+    /// shell's stable loopback origin.
+    #[test]
+    fn builds_connection_urls_per_kind() {
+        let local = Connection {
+            id: "local".into(),
+            name: "本地".into(),
+            kind: ConnKind::Local,
+            base: "http://127.0.0.1:58627".into(),
+            token: "tk".into(),
+        };
+        let local_url = connection_url(&local).to_string();
+        assert!(local_url.starts_with("http://127.0.0.1:"), "{local_url}");
+        assert!(local_url.contains("kimi_origin="), "{local_url}");
+        assert!(local_url.ends_with("#token=tk"), "{local_url}");
+
+        let remote = Connection {
+            id: "r".into(),
+            name: "远程".into(),
+            kind: ConnKind::Remote,
+            base: "http://192.168.31.106:58627".into(),
+            token: "tk".into(),
+        };
+        let remote_url = connection_url(&remote).to_string();
+        assert!(remote_url.starts_with("http://192.168.31.106:58627/"), "{remote_url}");
+        assert!(!remote_url.contains("kimi_origin"), "{remote_url}");
+        assert!(remote_url.ends_with("#token=tk"), "{remote_url}");
+    }
+
+    #[test]
+    fn persists_only_remote_connections() {
+        // The local daemon is derived fresh each launch; only remote
+        // connections (and their tokens) are written to disk.
+        let conns = vec![
+            Connection {
+                id: "local".into(),
+                name: "本地".into(),
+                kind: ConnKind::Local,
+                base: "http://127.0.0.1:58627".into(),
+                token: "secret-local".into(),
+            },
+            Connection {
+                id: "r".into(),
+                name: "远程".into(),
+                kind: ConnKind::Remote,
+                base: "http://10.0.0.9:60001".into(),
+                token: "secret-remote".into(),
+            },
+        ];
+        let remote: Vec<&Connection> =
+            conns.iter().filter(|c| c.kind == ConnKind::Remote).collect();
+        let raw = serde_json::to_string_pretty(&remote).unwrap();
+        assert!(raw.contains("secret-remote"));
+        assert!(!raw.contains("secret-local"));
+        let round: Vec<Connection> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(round.len(), 1);
+        assert_eq!(round[0].id, "r");
+        assert!(round[0].kind == ConnKind::Remote);
+    }
+
+    #[test]
+    fn daemon_candidates_orders_and_filters() {
+        let home = temp_home("candidates");
+        let (_l1, p1) = live_port();
+        let (_l2, p2) = live_port();
+        fs::write(
+            home.join("server/instances/older.json"),
+            format!(
+                r#"{{"server_id":"older","pid":1,"host":"127.0.0.1","port":{p1},"started_at":100,"host_version":"0.42.0"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            home.join("server/instances/newer.json"),
+            format!(
+                r#"{{"server_id":"newer","pid":2,"host":"0.0.0.0","port":{p2},"started_at":200,"host_version":"0.42.0"}}"#
+            ),
+        )
+        .unwrap();
+        let found = daemon_candidates(&home, Some("0.42.0"));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].port, p1); // longest-running first
+        assert_eq!(found[0].host, "127.0.0.1");
+        assert_eq!(found[1].port, p2);
+        assert_eq!(found[1].host, "127.0.0.1"); // wildcard bind normalizes
+
+        // A daemon older than the installed CLI is filtered out entirely.
+        fs::write(
+            home.join("server/instances/newer.json"),
+            format!(
+                r#"{{"server_id":"newer","pid":2,"host":"127.0.0.1","port":{p2},"started_at":200,"host_version":"0.41.0"}}"#
+            ),
+        )
+        .unwrap();
+        let filtered = daemon_candidates(&home, Some("0.42.0"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].port, p1);
+        let _ = fs::remove_dir_all(&home);
     }
 }

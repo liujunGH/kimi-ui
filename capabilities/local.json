@@ -16,6 +16,13 @@
     "allow-toggle-maximize",
     "allow-set-active-session",
     "allow-remote-control",
-    "allow-auto-update"
+    "allow-auto-update",
+    "allow-restart-daemon",
+    "allow-list-connections",
+    "allow-connection-status",
+    "allow-add-remote-connection",
+    "allow-remove-connection",
+    "allow-switch-connection",
+    "allow-daemon-snapshot"
   ]
 }

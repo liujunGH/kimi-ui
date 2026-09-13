@@ -1,19 +1,26 @@
 [package]
 name = "kimi-ui"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2021"
 description = "Tauri desktop shell for the official Kimi Code web UI"
 
 [dependencies]
 # custom-protocol: makes WebviewUrl::App resolve to embedded assets in release
 # builds too (bare `cargo build` would otherwise assume a dev server URL).
-tauri = { version = "2", features = ["custom-protocol", "unstable", "macos-private-api", "devtools"] }
+# dynamic-acl: add_capability() at runtime, so a remote daemon's page can be
+# granted the desktop-bridge commands when the user adds it as a connection.
+tauri = { version = "2", features = ["custom-protocol", "unstable", "macos-private-api", "devtools", "dynamic-acl"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # Release builds embed web-dist/ into the exe (single-file distribution).
 include_dir = "0.7"
 # Remote Control QR (rc-qrcode.png) -> data URL for the status card.
 base64 = "0.22"
+# In-app updates: the official plugin handles the signed manifest, download,
+# signature verification, bundle install and relaunch (see plugins.updater in
+# tauri.conf.json). process provides the relaunch command.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-window-state = "2"
 
