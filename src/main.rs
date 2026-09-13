@@ -85,7 +85,14 @@ mod static_server;
 
 /// Status strip height (collapsed), tab bar height, and overlay height (open).
 const STRIP: f64 = 28.0;
+/// Tab bar height when only the tab strip is shown, and the taller height it
+/// grows to while the "add connection" dialog is open. The dialog lives in the
+/// tab-bar webview, so that webview must actually be tall enough to contain it
+/// — a fixed 36px strip clips everything below the tabs.
 const TABBAR_H: f64 = 36.0;
+const TABBAR_EXPANDED_H: f64 = 420.0;
+/// Whether the tab bar is expanded to show the add-connection dialog.
+static TABBAR_EXPANDED: AtomicBool = AtomicBool::new(false);
 const OVERLAY_H: f64 = 340.0;
 /// Stable, shell-owned origin so Web Storage survives app restarts. Keep this
 /// outside Kimi's 58627+ daemon port range.
@@ -204,19 +211,50 @@ fn app_config_dir() -> PathBuf {
         .join("dev.kimiui.desktop")
 }
 
-/// Load persisted remote connections (the local one is always derived fresh).
+/// Load persisted connections. Remote entries carry their token; the local
+/// entry is stored as a *preferences only* stub (no token/base — those are
+/// re-derived from the live daemon each launch) so a renamed local tab keeps
+/// its name.
 fn load_connections() -> Vec<Connection> {
     let Ok(raw) = fs::read_to_string(connections_path()) else {
         return Vec::new();
     };
-    serde_json::from_str::<Vec<Connection>>(&raw).unwrap_or_default()
+    let mut conns: Vec<Connection> = serde_json::from_str(&raw).unwrap_or_default();
+    // Drop any persisted local entry: the caller re-derives it from the daemon.
+    conns.retain(|c| c.kind == ConnKind::Remote);
+    conns
 }
 
-/// Persist remote connections with owner-only permissions: the file holds
-/// bearer tokens, matching how the official CLI stores its own `server.token`.
+/// The persisted local tab name, if the user renamed it.
+fn load_local_name() -> Option<String> {
+    let raw = fs::read_to_string(connections_path()).ok()?;
+    let conns: Vec<Connection> = serde_json::from_str(&raw).ok()?;
+    conns
+        .iter()
+        .find(|c| c.kind == ConnKind::Local)
+        .map(|c| c.name.clone())
+}
+
+/// Persist remote connections (token included) plus the local tab's name.
+/// Owner-only permissions: the file holds bearer tokens, matching how the
+/// official CLI stores its own `server.token`.
 fn save_connections(conns: &[Connection]) {
-    let remote: Vec<&Connection> = conns.iter().filter(|c| c.kind == ConnKind::Remote).collect();
-    let Ok(json) = serde_json::to_string_pretty(&remote) else { return };
+    // Remote connections keep everything; the local one is stored name-only so
+    // the file never carries a local token it does not need.
+    let persisted: Vec<Connection> = conns
+        .iter()
+        .map(|c| match c.kind {
+            ConnKind::Remote => c.clone(),
+            ConnKind::Local => Connection {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                kind: ConnKind::Local,
+                base: String::new(),
+                token: String::new(),
+            },
+        })
+        .collect();
+    let Ok(json) = serde_json::to_string_pretty(&persisted) else { return };
     let dir = app_config_dir();
     let _ = fs::create_dir_all(&dir);
     let path = connections_path();
@@ -1518,6 +1556,27 @@ fn remove_connection(app: tauri::AppHandle, id: String) -> Result<Value, String>
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Rename a connection's tab. Handy when several addresses are configured.
+#[tauri::command]
+fn rename_connection(app: tauri::AppHandle, id: String, name: String) -> Result<Value, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+    if let Some(state) = app.try_state::<SharedConnections>() {
+        let mut guard = state.lock().map_err(|e| e.to_string())?;
+        let Some(conn) = guard.iter_mut().find(|c| c.id == id) else {
+            return Err("连接不存在".to_string());
+        };
+        conn.name = trimmed.to_string();
+        save_connections(&guard);
+    } else {
+        return Err("连接不存在".to_string());
+    }
+    refresh_tabs(&app);
+    Ok(serde_json::json!({ "ok": true }))
+}
+
 /// Switch the visible tab.
 #[tauri::command]
 fn switch_connection(app: tauri::AppHandle, id: String) -> Result<Value, String> {
@@ -1543,6 +1602,15 @@ fn set_overlay(app: tauri::AppHandle, mode: String) {
     layout_strip(&app);
 }
 
+/// Grow/shrink the tab bar so its add-connection dialog is fully visible.
+/// The dialog is HTML inside the tab-bar webview, so the webview itself has to
+/// be tall enough — it cannot overflow its own bounds.
+#[tauri::command]
+fn set_tabbar_expanded(app: tauri::AppHandle, expanded: bool) {
+    TABBAR_EXPANDED.store(expanded, Ordering::Relaxed);
+    layout_strip(&app);
+}
+
 /// Recompute every view's bounds. The tab bar and status strip are pinned to
 /// the window edges; connection views share the space between them and only
 /// the active one is visible (hidden views keep their page alive).
@@ -1552,12 +1620,14 @@ fn layout_strip(app: &tauri::AppHandle) {
     let w = size.width as f64 / scale;
     let h = size.height as f64 / scale;
 
-    let content_y = TABBAR_H;
-    let content_h = (h - TABBAR_H - STRIP).max(200.0);
+    let tabbar_expanded = TABBAR_EXPANDED.load(Ordering::Relaxed);
+    let tabbar_h = if tabbar_expanded { TABBAR_EXPANDED_H } else { TABBAR_H };
+    let content_y = tabbar_h;
+    let content_h = (h - tabbar_h - STRIP).max(200.0);
 
     if let Some(tabbar) = app.get_webview("tabbar") {
         let _ = tabbar.set_position(LogicalPosition::new(0.0, 0.0));
-        let _ = tabbar.set_size(LogicalSize::new(w, TABBAR_H));
+        let _ = tabbar.set_size(LogicalSize::new(w, tabbar_h));
     }
     // Every connection view gets the full content rect; visibility decides
     // which one is on screen, so switching needs no resize.
@@ -2182,7 +2252,9 @@ fn main() {
             add_remote_connection,
             remove_connection,
             switch_connection,
-            daemon_snapshot
+            daemon_snapshot,
+            rename_connection,
+            set_tabbar_expanded
         ])
         .manage(SharedDaemon::new(None))
         .manage(SharedConnections::new(Vec::new()))
@@ -2258,7 +2330,8 @@ fn main() {
                 Ok(launch) => {
                     let conn = Connection {
                         id: "local".to_string(),
-                        name: "本地".to_string(),
+                        // Honour a rename from a previous session.
+                        name: load_local_name().unwrap_or_else(|| "本地".to_string()),
                         kind: ConnKind::Local,
                         base: launch.base.clone(),
                         token: launch.token.clone(),
@@ -2278,7 +2351,7 @@ fn main() {
                     // No daemon: still show a view so the boot guidance renders.
                     let conn = Connection {
                         id: "local".to_string(),
-                        name: "本地".to_string(),
+                        name: load_local_name().unwrap_or_else(|| "本地".to_string()),
                         kind: ConnKind::Local,
                         base: String::new(),
                         token: String::new(),
@@ -3477,6 +3550,55 @@ mod tests {
         assert!(remote_url.starts_with("http://192.168.31.106:58627/"), "{remote_url}");
         assert!(!remote_url.contains("kimi_origin"), "{remote_url}");
         assert!(remote_url.ends_with("#token=tk"), "{remote_url}");
+    }
+
+    /// The local tab's NAME must survive a restart, while its base/token stay
+    /// out of the file (re-derived from the live daemon each launch).
+    #[test]
+    fn persists_local_name_but_not_local_credentials() {
+        let conns = vec![
+            Connection {
+                id: "local".into(),
+                name: "本机".into(),
+                kind: ConnKind::Local,
+                base: "http://127.0.0.1:58627".into(),
+                token: "secret-local".into(),
+            },
+            Connection {
+                id: "r".into(),
+                name: "台式机".into(),
+                kind: ConnKind::Remote,
+                base: "http://10.0.0.9:60001".into(),
+                token: "secret-remote".into(),
+            },
+        ];
+        // Mirror save_connections' projection.
+        let persisted: Vec<Connection> = conns
+            .iter()
+            .map(|c| match c.kind {
+                ConnKind::Remote => c.clone(),
+                ConnKind::Local => Connection {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    kind: ConnKind::Local,
+                    base: String::new(),
+                    token: String::new(),
+                },
+            })
+            .collect();
+        let raw = serde_json::to_string(&persisted).unwrap();
+
+        // Local name kept, local secret dropped, remote intact.
+        assert!(raw.contains("本机"), "local name must persist: {raw}");
+        assert!(!raw.contains("secret-local"), "local token must not persist");
+        assert!(raw.contains("secret-remote"));
+        assert!(raw.contains("台式机"));
+
+        // load_local_name reads it back; load_connections drops the local stub.
+        let round: Vec<Connection> = serde_json::from_str(&raw).unwrap();
+        let local = round.iter().find(|c| c.kind == ConnKind::Local).unwrap();
+        assert_eq!(local.name, "本机");
+        assert!(local.base.is_empty() && local.token.is_empty());
     }
 
     #[test]

@@ -13,6 +13,20 @@
         background: transparent;
         user-select: none;
       }
+      /* While the dialog is open Rust grows this webview; the page must fill
+         it (not the 36px strip) or the dialog would be clipped. */
+      html.expanded, body.expanded { height: 100vh; overflow: visible; }
+      body.expanded { background: var(--bg); }
+      .tab input.rename {
+        width: 120px;
+        padding: 1px 4px;
+        font: inherit;
+        color: var(--fg);
+        background: transparent;
+        border: 1px solid var(--accent);
+        border-radius: 4px;
+        outline: none;
+      }
       :root {
         --bg: rgba(246, 246, 246, 0.96);
         --fg: #24292f;
@@ -80,7 +94,7 @@
       #spacer { flex: 1; min-width: 8px; }
       #dialog {
         position: fixed;
-        top: 40px;
+        top: 44px;
         left: 88px;
         display: none;
         background: var(--bg);
@@ -116,6 +130,22 @@
         cursor: pointer;
       }
       #dialog .actions span.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+      /* Right-click menu for a tab (rename / close). */
+      #ctx {
+        position: fixed;
+        display: none;
+        min-width: 120px;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        box-shadow: 0 8px 26px rgba(0, 0, 0, 0.24);
+        padding: 4px;
+        color: var(--fg);
+      }
+      #ctx.show { display: block; }
+      #ctx .item { padding: 5px 10px; border-radius: 5px; cursor: pointer; }
+      #ctx .item:hover { background: var(--active); }
+      #ctx .item.danger:hover { background: rgba(248, 81, 73, 0.18); color: #f85149; }
     </style>
   </head>
   <body>
@@ -142,10 +172,15 @@
         <span id="ok" class="primary">连接</span>
       </div>
     </div>
+    <div id="ctx">
+      <div class="item" id="ctxRename">重命名…</div>
+      <div class="item danger" id="ctxClose">关闭连接</div>
+    </div>
     <script>
       'use strict';
       var active = null;
       var conns = [];
+      var ctxTarget = null;   // connection id the context menu acts on
 
       function invoke(cmd, args) {
         return window.__TAURI_INTERNALS__.invoke(cmd, args || {});
@@ -154,6 +189,80 @@
         return String(s).replace(/[&<>"]/g, function (c) {
           return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
         });
+      }
+
+      // ---- context menu ----
+      function hideCtx() { document.getElementById('ctx').className = ''; }
+      function showCtx(x, y, conn) {
+        ctxTarget = conn;
+        var el = document.getElementById('ctx');
+        // The tab-bar webview is only 36px tall unless expanded, so a menu
+        // needs the taller viewport; ask Rust to grow it, then place the menu.
+        document.documentElement.className = 'expanded';
+        document.body.className = 'expanded';
+        invoke('set_tabbar_expanded', { expanded: true }).catch(function () {});
+        el.className = 'show';
+        // Place at the click point, clamped so the menu stays in the grown
+        // viewport (it is ~64px tall).
+        el.style.left = Math.min(x, window.innerWidth - 140) + 'px';
+        el.style.top = Math.min(y, window.innerHeight - 70) + 'px';
+      }
+      function closeCtx() {
+        hideCtx();
+        ctxTarget = null;
+        if (document.getElementById('dialog').className !== 'show') {
+          document.documentElement.className = '';
+          document.body.className = '';
+          invoke('set_tabbar_expanded', { expanded: false }).catch(function () {});
+        }
+      }
+      document.addEventListener('mousedown', function (e) {
+        if (!e.target.closest('#ctx')) closeCtx();
+      });
+      document.getElementById('ctxRename').onclick = function () {
+        var conn = ctxTarget;
+        closeCtx();
+        if (conn) startRename(conn);
+      };
+      document.getElementById('ctxClose').onclick = function () {
+        var conn = ctxTarget;
+        closeCtx();
+        if (conn && conn.id !== 'local') {
+          invoke('remove_connection', { id: conn.id }).catch(function () {});
+        }
+      };
+
+      // ---- inline rename: swap the tab's label for an input ----
+      function startRename(conn) {
+        var boxes = document.querySelectorAll('.tab .name');
+        for (var i = 0; i < boxes.length; i++) {
+          var el = boxes[i];
+          if (el.dataset.id !== conn.id) continue;
+          var input = document.createElement('input');
+          input.className = 'rename';
+          input.value = conn.name;
+          input.spellcheck = false;
+          el.replaceWith(input);
+          input.focus();
+          input.select();
+          var done = false;
+          function commit(save) {
+            if (done) return;
+            done = true;
+            var value = input.value.trim();
+            if (save && value && value !== conn.name) {
+              invoke('rename_connection', { id: conn.id, name: value }).catch(function () {});
+            } else {
+              render();
+            }
+          }
+          input.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+            else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+          });
+          input.addEventListener('blur', function () { commit(true); });
+          break;
+        }
       }
 
       function render() {
@@ -167,8 +276,9 @@
           tab.appendChild(dot);
           var nm = document.createElement('span');
           nm.className = 'name';
+          nm.dataset.id = c.id;
           nm.textContent = c.name;
-          nm.title = c.base || '';
+          nm.title = (c.base || '') + '（右键可重命名）';
           tab.appendChild(nm);
           if (c.id !== 'local') {
             var x = document.createElement('span');
@@ -184,6 +294,10 @@
           tab.onclick = function () {
             if (c.id !== active) invoke('switch_connection', { id: c.id }).catch(function () {});
           };
+          tab.oncontextmenu = function (e) {
+            e.preventDefault();
+            showCtx(e.clientX, e.clientY, c);
+          };
           box.appendChild(tab);
         });
       }
@@ -198,11 +312,23 @@
       document.getElementById('addBtn').onclick = function () {
         document.getElementById('dialog').className = 'show';
         document.getElementById('err').textContent = '';
+        // Rust grows this webview so the dialog fits; the page fills it.
+        document.documentElement.className = 'expanded';
+        document.body.className = 'expanded';
+        invoke('set_tabbar_expanded', { expanded: true }).catch(function () {});
         document.getElementById('addr').focus();
       };
-      document.getElementById('cancel').onclick = function () {
+      function closeDialog() {
         document.getElementById('dialog').className = '';
-      };
+        document.documentElement.className = '';
+        document.body.className = '';
+        invoke('set_tabbar_expanded', { expanded: false }).catch(function () {});
+      }
+      document.getElementById('cancel').onclick = closeDialog;
+      // Esc also closes (and shrinks the webview back).
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') closeDialog();
+      });
       document.getElementById('ok').onclick = function () {
         var err = document.getElementById('err');
         err.textContent = '连接中…';
@@ -211,11 +337,11 @@
           address: document.getElementById('addr').value,
           token: document.getElementById('token').value
         }).then(function () {
-          document.getElementById('dialog').className = '';
           document.getElementById('addr').value = '';
           document.getElementById('name').value = '';
           document.getElementById('token').value = '';
           err.textContent = '';
+          closeDialog();
         }).catch(function (e) {
           err.textContent = String(e);
         });

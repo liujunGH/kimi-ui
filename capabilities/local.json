@@ -23,6 +23,8 @@
     "allow-add-remote-connection",
     "allow-remove-connection",
     "allow-switch-connection",
-    "allow-daemon-snapshot"
+    "allow-daemon-snapshot",
+    "allow-rename-connection",
+    "allow-set-tabbar-expanded"
   ]
 }

@@ -32,6 +32,8 @@ fn main() {
             "remove_connection",
             "switch_connection",
             "daemon_snapshot",
+            "rename_connection",
+            "set_tabbar_expanded",
         ]),
     ))
     .expect("failed to run tauri-build");
